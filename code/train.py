@@ -19,6 +19,7 @@ from rl.memory import SequentialMemory
 from rl.random import OrnsteinUhlenbeckProcess
 from tensorflow.keras.optimizers.legacy import Adam
 import time
+import csv
 
 # ========== SETUP QUIET ENVIRONMENT ==========
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow info/warning messages
@@ -44,6 +45,7 @@ MAX_OPEN_TRADES = 3
 DAILY_DD_LIMIT = 0.08
 MIN_RISK = 0.01
 MAX_RISK = 0.02
+LOG_INTERVAL = 30  # seconds
 
 # ========== 2) DATA LOADING ==========
 def load_all_data():
@@ -127,7 +129,14 @@ class ForexMultiEnv(gym.Env):
         self.episode_trades = 0
         self.episode_reward = 0
         self.total_trades = 0
+        self.completed_trades = []  # track recently closed trades
         self.last_progress_report = time.time()
+
+        # prepare trade log file
+        self.trade_log_path = os.path.join(MODEL_DIR, "trade_log.csv")
+        with open(self.trade_log_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["symbol", "entry_step", "exit_step", "lot_size", "pnl"])
 
     def reset(self):
         self.balance = self.initial_balance
@@ -138,6 +147,15 @@ class ForexMultiEnv(gym.Env):
         self.observation = self._get_observation(self.current_step)
         self.episode_trades = 0
         self.episode_reward = 0
+        self.total_trades = 0
+        self.completed_trades = []
+        self.last_progress_report = time.time()
+
+        # reset trade log file
+        with open(self.trade_log_path, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["symbol", "entry_step", "exit_step", "lot_size", "pnl"])
+
         return self.observation
 
     def step(self, action):
@@ -148,16 +166,9 @@ class ForexMultiEnv(gym.Env):
         signal, sl_mult, tp_mult, sent_exit_thresh, confidence = action.tolist()
         reward, done, info = 0.0, False, {}
 
-        # Dynamic confidence threshold (starts low, increases with experience)
+        # Dynamic confidence threshold
         current_min_confidence = max(0.25, min(0.65, 0.25 + (self.episode_trades / 1000)))
         dd_current = (self.initial_balance - self.balance) / self.initial_balance
-
-        # —— DEBUG LOGGING ADDED HERE ——
-        print(f"[DEBUG ENTRY] Step {self.current_step} | Symbol {symbol} | "
-              f"Conf {confidence:.3f} vs Min {current_min_confidence:.3f} | "
-              f"OpenPos {len(self.open_positions)} | ATR {row['ATR_14']:.6f} | "
-              f"Bal {self.balance:.2f}")
-        # ————————————————————————
 
         if dd_current >= DAILY_DD_LIMIT:
             return obs, reward, True, info
@@ -213,7 +224,7 @@ class ForexMultiEnv(gym.Env):
                 self.last_entry_step[symbol] = self.current_step
                 self.episode_trades += 1
                 self.total_trades += 1
-                reward += 0.002  # Small reward for attempting a trade
+                reward += 0.002  # Small reward
 
         # TRADE MANAGEMENT & EXIT
         if symbol in self.open_positions:
@@ -242,7 +253,7 @@ class ForexMultiEnv(gym.Env):
                 pnl = (exit_price - entry_price) * direction * (lot_size / pip_value)
                 closed = True
 
-            # Sentiment-based Exit
+            # Sentiment Exit
             elif (direction == 1 and row["avg_sentiment"] <= sent_thresh) or \
                  (direction == -1 and row["avg_sentiment"] >= sent_thresh):
                 exit_price = close_price
@@ -258,9 +269,28 @@ class ForexMultiEnv(gym.Env):
 
                 drawdown_penalty = 1.7 * (-pnl if pnl < 0 else 0.0)
                 reward += pnl - overtrade_penalty - drawdown_penalty
+
+                # record completed trade
+                trade = {
+                    "symbol": symbol,
+                    "entry_step": pos["entry_step"],
+                    "exit_step": self.current_step,
+                    "lot_size": pos["lot_size"],
+                    "pnl": pnl
+                }
+                self.completed_trades.append(trade)
+                # append to CSV log
+                with open(self.trade_log_path, mode="a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([trade["symbol"],
+                                     trade["entry_step"],
+                                     trade["exit_step"],
+                                     f"{trade['lot_size']:.2f}",
+                                     f"{trade['pnl']:.2f}"])
+
                 del self.open_positions[symbol]
 
-        # Small penalty for doing nothing (only applied 10% of the time)
+        # Small penalty for doing nothing
         if len(self.open_positions) == 0 and random.random() < 0.1:
             reward -= 0.001
 
@@ -277,14 +307,19 @@ class ForexMultiEnv(gym.Env):
         info["open_positions"] = len(self.open_positions)
         info["episode_trades"] = self.episode_trades
 
-        # Progress reporting every 60 seconds (UNCHANGED)
+        # Progress reporting every LOG_INTERVAL seconds with trade outcomes
         current_time = time.time()
-        if current_time - self.last_progress_report >= 60:
+        if current_time - self.last_progress_report >= LOG_INTERVAL:
             progress = (self.current_step / self.n_rows) * 100
             print(f"\n[Progress] Step: {self.current_step}/{self.n_rows} ({progress:.1f}%) | "
-                  f"Balance: ${self.balance:,.2f} | "
-                  f"Trades: {self.total_trades} (Current: {len(self.open_positions)}) | "
-                  f"Drawdown: {self.max_drawdown*100:.1f}%")
+                  f"Balance: ${self.balance:,.2f} | Drawdown: {self.max_drawdown*100:.1f}% | "
+                  f"OpenPos: {len(self.open_positions)} | Total trades: {self.total_trades}")
+            if self.completed_trades:
+                print(" Recent trades:")
+                for t in self.completed_trades:
+                    print(f"  • {t['symbol']} entry@{t['entry_step']} exit@{t['exit_step']} "
+                          f"lot={t['lot_size']:.2f} pnl={t['pnl']:.2f}")
+                self.completed_trades = []
             self.last_progress_report = current_time
 
         self.episode_reward += reward
@@ -345,14 +380,14 @@ def train_agent():
     actor = build_actor((1,) + env.observation_space.shape, env.action_space)
     critic = build_critic((1,) + env.observation_space.shape, env.action_space)
 
-    # Configure agent with more exploration
+    # Configure agent
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
     random_process = OrnsteinUhlenbeckProcess(
         size=nb_actions,
-        theta=0.25,  # Increased from 0.15 for faster adaptation
+        theta=0.25,
         mu=0.0,
-        sigma=0.3,   # Increased from 0.2 for more exploration
-        sigma_min=0.05  # Minimum noise
+        sigma=0.3,
+        sigma_min=0.05
     )
 
     agent = DDPGAgent(
@@ -361,8 +396,8 @@ def train_agent():
         critic=critic,
         critic_action_input=critic.input[1],
         memory=memory,
-        nb_steps_warmup_critic=5000,  # Increased from 1000
-        nb_steps_warmup_actor=5000,   # Increased from 1000
+        nb_steps_warmup_critic=5000,
+        nb_steps_warmup_actor=5000,
         random_process=random_process,
         gamma=DISCOUNT_FACTOR,
         target_model_update=1e-3,
@@ -372,7 +407,7 @@ def train_agent():
 
     # Train
     print(f"\n▶ Starting training for {TRAIN_STEPS} steps (this will take hours)...")
-    print(" Progress will be shown as 'episode/reward/balance' updates")
+    print(" Progress will be shown every 30 seconds with recent trades")
     agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=2, nb_max_episode_steps=env.n_rows)
 
     # Save models
@@ -383,17 +418,16 @@ def train_agent():
     critic.save_weights(critic_path)
     agent.save_weights(weights_path, overwrite=True)
 
-    # ===== ADD: final training summary =====
+    # ===== final summary =====
     print("\n=== Training Summary ===")
     print(f"Final balance: ${env.balance:,.2f}")
     print(f"Total trades: {env.total_trades}")
     print(f"Max drawdown: {env.max_drawdown * 100:.2f}%")
-    # ================================
-
     print("\n✓ Training complete! Saved models:")
     print(f"- Actor: {actor_path}")
     print(f"- Critic: {critic_path}")
     print(f"- Weights: {weights_path}")
+    print(f"✓ Trade log written to {env.trade_log_path}")
 
 if __name__ == "__main__":
     # GPU configuration
