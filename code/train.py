@@ -1,76 +1,55 @@
 # train.py
-
-# Corrected RL training script with critical fixes:
-
-# 1. Fixed trade exit logic - positions now remain open until
-#    SL/TP/sentiment triggers
-# 2. Added sentiment-based exit condition as originally designed
-# 3. Restructured observations - uses per-symbol features instead of
-#    averages
-# 4. Added symbol identification to state vector
-# 5. Fixed trade management logic
-# 6. Added scaler saving for live trading compatibility
-
 import os
 import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
 from sklearn.preprocessing import StandardScaler
-import joblib  # Added for scaler saving
+import joblib
 from sklearn.metrics import pairwise_distances
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Concatenate, Flatten  # Added Flatten
+from tensorflow.keras.layers import Input, Dense, Concatenate, Flatten
 import tensorflow as tf
 import gym
 from gym import spaces
 from rl.agents import DDPGAgent
 from rl.memory import SequentialMemory
 from rl.random import OrnsteinUhlenbeckProcess
-
-# FIX 1: Use legacy Adam optimizer for Keras-RL2 compatibility
 from tensorflow.keras.optimizers.legacy import Adam
 
-print("TF Version:", tf.__version__)
-print("GPU Available:", tf.config.list_physical_devices('GPU'))
-tf.debugging.set_log_device_placement(True)  # Log GPU operations
+# ========== SETUP QUIET ENVIRONMENT ==========
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow info/warning messages
+tf.get_logger().setLevel('ERROR')
+tf.autograph.set_verbosity(0)
 
 # ========== 1) GLOBAL CONFIGURATION ==========
 SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
 
-# Make all paths relative to the repo root (one level up from this script)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed")  # processed CSVs folder
-NEWS_CSV = os.path.join(BASE_DIR, "Data", "news_cache.csv")  # daily news sentiment cache
-MODEL_DIR = os.path.join(BASE_DIR, "model")  # where to save actor/critic/weights
-
-# Ensure the model directory exists
+DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed")
+NEWS_CSV = os.path.join(BASE_DIR, "Data", "news_cache.csv")
+MODEL_DIR = os.path.join(BASE_DIR, "model")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Hyperparameters
-INITIAL_BALANCE = 100000.0  # Starting equity
-DISCOUNT_FACTOR = 0.99  # Gamma for DDPG
-TRAIN_STEPS = 200000  # Total training steps
-MEMORY_LIMIT = 1000000  # Replay memory size
-BATCH_SIZE = 64  # Batch size for DDPG
-OVERTRADE_BARS = 12  # 12 M5 bars ~ 1 hour
-MAX_OPEN_TRADES = 3  # Max concurrent open trades
-DAILY_DD_LIMIT = 0.08  # 8% daily drawdown circuit breaker
-
-# 1-2% risk scaling: if confidence=0 -> 1%, if confidence=1 -> 2%
+INITIAL_BALANCE = 100000.0
+DISCOUNT_FACTOR = 0.99
+TRAIN_STEPS = 200000
+MEMORY_LIMIT = 1000000
+BATCH_SIZE = 64
+OVERTRADE_BARS = 12
+MAX_OPEN_TRADES = 3
+DAILY_DD_LIMIT = 0.08
 MIN_RISK = 0.01
 MAX_RISK = 0.02
 
-# ========== 2) LOAD ALL DATA PREPARED BY preprocess_data.py + MERGE NEWS ==========
+# ========== 2) DATA LOADING ==========
 def load_all_data():
-    """
-    Load processed CSVs for each symbol, add 'symbol' column, concatenate,
-    sort by time & symbol, then merge in daily news_count & avg_sentiment.
-    """
+    """Load and merge all market data with news sentiment."""
+    print("\n[1/4] Loading market data...")
     frames = []
     for sym in SYMBOLS:
         path = os.path.join(DATA_DIR, f"{sym}_processed.csv")
-        print(f"Loading {path}")
         df = pd.read_csv(path, parse_dates=["time"])
         df["symbol"] = sym
         frames.append(df)
@@ -79,10 +58,9 @@ def load_all_data():
     all_df.sort_values(by=["time","symbol"], inplace=True)
     all_df.reset_index(drop=True, inplace=True)
     
-    # ---- Merge daily news sentiment/cache ----
+    print("[2/4] Merging news sentiment...")
     news = pd.read_csv(NEWS_CSV, parse_dates=["date"])
     
-    # Handle timezone mismatch between datasets
     if news['date'].dt.tz is None:
         news['date'] = news['date'].dt.tz_localize('UTC')
     else:
@@ -98,7 +76,8 @@ def load_all_data():
 
 ALL_DATA = load_all_data()
 
-# Build a dictionary of H1 closes for correlation calculations
+# Build H1 closes dictionary
+print("[3/4] Preparing correlation data...")
 H1_CLOSES = {}
 for sym in SYMBOLS:
     df_sym = ALL_DATA[ALL_DATA["symbol"] == sym].copy()
@@ -107,7 +86,7 @@ for sym in SYMBOLS:
     h1_df.set_index("time", inplace=True)
     H1_CLOSES[sym] = h1_df["close"]
 
-# ========== 3) CUSTOM GYM ENVIRONMENT ==========
+# ========== 3) ENVIRONMENT CLASS ==========
 class ForexMultiEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
     
@@ -285,7 +264,7 @@ class ForexMultiEnv(gym.Env):
     def close(self):
         pass
 
-# ========== 4) BUILD ACTOR & CRITIC NETWORKS ==========
+# ========== 4) MODEL ARCHITECTURES ==========
 def build_actor(input_shape, action_space):
     state_input = Input(shape=input_shape, name="state_input")
     x = Flatten()(state_input)
@@ -309,26 +288,25 @@ def build_critic(input_shape, action_space):
     q_value = Dense(1, activation="linear", name="q_value")(x)
     return Model(inputs=[state_input, action_input], outputs=q_value)
 
-# ========== 5) MAIN TRAINING ROUTINE ==========
+# ========== 5) TRAINING ROUTINE ==========
 def train_agent():
-    # 5.1 Create environment
+    print("\n[4/4] Initializing training environment...")
     env = ForexMultiEnv(ALL_DATA, initial_balance=INITIAL_BALANCE)
     nb_actions = env.action_space.shape[0]
     
-    # 5.1.1 SAVE SCALER FOR LIVE TRADING (CRITICAL ADDITION)
+    # Save scaler
     scaler_path = os.path.join(MODEL_DIR, "scaler.pkl")
     joblib.dump(env.scaler, scaler_path)
-    print(f"Saved feature scaler to {scaler_path} for live trading")
+    print(f"✓ Scaler saved to {scaler_path}")
     
-    # 5.2 Build actor & critic
+    # Build models
     actor = build_actor((1,) + env.observation_space.shape, env.action_space)
     critic = build_critic((1,) + env.observation_space.shape, env.action_space)
     
-    # 5.3 Configure memory & random process
+    # Configure agent
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
     random_process = OrnsteinUhlenbeckProcess(size=nb_actions, theta=0.15, mu=0.0, sigma=0.2)
     
-    # 5.4 Build DDPG agent
     agent = DDPGAgent(
         nb_actions=nb_actions,
         actor=actor,
@@ -343,34 +321,35 @@ def train_agent():
         batch_size=BATCH_SIZE,
     )
     
-    # FIX 2: Use legacy Adam optimizer
     agent.compile(Adam(learning_rate=1e-4, clipnorm=1.0), metrics=["mae"])
     
-    # 5.5 Train the agent
-    print(f"Starting DDPG training for {TRAIN_STEPS} steps...")
+    # Train
+    print(f"\n▶ Starting training for {TRAIN_STEPS} steps (this will take hours)...")
+    print("   Progress will be shown as 'episode/reward/balance' updates")
     agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=2, nb_max_episode_steps=env.n_rows)
     
-    # 5.6 Save models & weights
+    # Save models
     actor_path = os.path.join(MODEL_DIR, "actor_model.h5")
     critic_path = os.path.join(MODEL_DIR, "critic_model.h5")
     weights_path = os.path.join(MODEL_DIR, "ddpg_weights.h5f")
     
     actor.save(actor_path)
-    print(f"Saved actor to {actor_path}")
-    
-    # Replace critic.save() with save_weights() to avoid the iteration-variable error
     critic.save_weights(critic_path)
-    print(f"Saved critic weights to {critic_path}")
-    
     agent.save_weights(weights_path, overwrite=True)
-    print(f"Saved DDPG agent weights to {weights_path}")
-    print("Training complete. Models and weights saved.")
+    
+    print("\n✓ Training complete! Saved models:")
+    print(f"- Actor: {actor_path}")
+    print(f"- Critic: {critic_path}")
+    print(f"- Weights: {weights_path}")
 
 if __name__ == "__main__":
-    # Limit TensorFlow GPU memory growth
-    physical_devices = tf.config.experimental.list_physical_devices("GPU")
+    # GPU configuration
+    physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
-        for dev in physical_devices:
-            tf.config.experimental.set_memory_growth(dev, True)
+        tf.config.experimental.set_memory_growth(physical_devices[0], True)
     
-    train_agent()
+    try:
+        train_agent()
+    except Exception as e:
+        print(f"\n⚠️ Training failed: {str(e)}")
+        print("Check your data files and GPU availability")
