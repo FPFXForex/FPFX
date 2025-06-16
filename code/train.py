@@ -20,7 +20,6 @@ from tensorflow.keras.optimizers.legacy import Adam
 
 # ========== SETUP QUIET ENVIRONMENT ==========
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow info/warning messages
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 tf.get_logger().setLevel('ERROR')
 tf.autograph.set_verbosity(0)
 
@@ -44,49 +43,36 @@ DAILY_DD_LIMIT = 0.08
 MIN_RISK = 0.01
 MAX_RISK = 0.02
 
-# ========== 2) OPTIMIZED DATA LOADING ==========
+# ========== 2) DATA LOADING ==========
 def load_all_data():
-    """Optimized data loading with pre-allocation"""
+    """Load and merge all market data with news sentiment."""
     print("\n[1/4] Loading market data...")
-    
-    # Pre-allocate list for faster concatenation
     frames = []
     for sym in SYMBOLS:
         path = os.path.join(DATA_DIR, f"{sym}_processed.csv")
         df = pd.read_csv(path, parse_dates=["time"])
         df["symbol"] = sym
         frames.append(df)
-    
     all_df = pd.concat(frames, ignore_index=True)
     all_df.sort_values(by=["time","symbol"], inplace=True)
     all_df.reset_index(drop=True, inplace=True)
 
     print("[2/4] Merging news sentiment...")
     news = pd.read_csv(NEWS_CSV, parse_dates=["date"])
-    
-    # Vectorized timezone conversion
     if news['date'].dt.tz is None:
         news['date'] = news['date'].dt.tz_localize('UTC')
     else:
         news['date'] = news['date'].dt.tz_convert('UTC')
-    
     all_df["date"] = all_df["time"].dt.tz_convert('UTC').dt.floor("D")
     all_df = all_df.merge(news, how="left", on=["date","symbol"])
-    
-    # Vectorized fillna
-    all_df["news_count"] = all_df["news_count"].fillna(0).astype(np.float32)
-    all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0).astype(np.float32)
+    all_df["news_count"] = all_df["news_count"].fillna(0)
+    all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
     all_df.drop(columns=["date"], inplace=True)
-    
-    # Convert to categorical for faster processing
-    all_df["symbol"] = all_df["symbol"].astype('category')
-    
     return all_df
 
-# Load data once and keep in memory
 ALL_DATA = load_all_data()
 
-# Build H1 closes dictionary with numpy arrays for faster access
+# Build H1 closes dictionary
 print("[3/4] Preparing correlation data...")
 H1_CLOSES = {}
 for sym in SYMBOLS:
@@ -94,9 +80,9 @@ for sym in SYMBOLS:
     df_sym["minute"] = df_sym["time"].dt.minute
     h1_df = df_sym[df_sym["minute"] == 0][["time", "close"]].copy()
     h1_df.set_index("time", inplace=True)
-    H1_CLOSES[sym] = h1_df["close"].values  # Store as numpy array
+    H1_CLOSES[sym] = h1_df["close"]
 
-# ========== 3) OPTIMIZED ENVIRONMENT CLASS ==========
+# ========== 3) ENVIRONMENT CLASS ==========
 class ForexMultiEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
 
@@ -106,10 +92,8 @@ class ForexMultiEnv(gym.Env):
         self.symbols = SYMBOLS
         self.n_rows = len(self.all_data)
         self.symbol_to_id = {sym: i for i, sym in enumerate(SYMBOLS)}
-        
-        # Pre-compute feature columns
-        self.feature_cols = [c for c in self.all_data.columns if c not in ["time","symbol"]]
-        self.feature_count = len(self.feature_cols)
+        feature_cols = [c for c in self.all_data.columns if c not in ["time","symbol"]]
+        self.feature_count = len(feature_cols)
         
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -117,74 +101,67 @@ class ForexMultiEnv(gym.Env):
             shape=(self.feature_count + len(SYMBOLS),),
             dtype=np.float32
         )
-
+        
         low = np.array([0.0, 0.5, 0.5, -0.1, 0.0], dtype=np.float32)
         high = np.array([1.0, 5.0, 5.0, 0.1, 1.0], dtype=np.float32)
         self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
-
-        # Convert to numpy for faster access
-        self.times = self.all_data["time"].values
-        self.symbols_data = self.all_data["symbol"].cat.codes.values
-        self.features = self.all_data[self.feature_cols].values.astype(np.float32)
         
-        # Initialize scaler
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.max_drawdown = 0.0
+        self.open_positions = {}
+        self.last_entry_step = {sym: -OVERTRADE_BARS - 1 for sym in self.symbols}
+        self.features = self.all_data[feature_cols].values
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
-        
-        # Initialize balance (FIX ADDED HERE)
-        self.initial_balance = initial_balance
-        self.reset()
-        
-        # Debug stats
-        self.last_log_time = datetime.now()
-        self.steps_since_log = 0
+        self.current_step = 0
+        self.observation = self._get_observation(self.current_step)
+        self.episode_trades = 0
+        self.episode_reward = 0
 
     def reset(self):
         self.balance = self.initial_balance
         self.max_drawdown = 0.0
-        self.open_positions = {}
+        self.open_positions.clear()
         self.last_entry_step = {sym: -OVERTRADE_BARS - 1 for sym in self.symbols}
         self.current_step = 0
         self.observation = self._get_observation(self.current_step)
+        self.episode_trades = 0
+        self.episode_reward = 0
         return self.observation
 
     def step(self, action):
-        # Debug logging
-        current_time = datetime.now()
-        if (current_time - self.last_log_time).seconds >= 60:
-            print(f"\nProgress: {self.current_step}/{self.n_rows} steps | "
-                  f"Balance: {self.balance:.2f} | "
-                  f"Positions: {len(self.open_positions)}")
-            self.last_log_time = current_time
-        
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        
-        # Vectorized data access
-        symbol_code = self.symbols_data[self.current_step]
-        symbol = SYMBOLS[symbol_code]
         row = self.all_data.iloc[self.current_step]
-        
+        symbol = row["symbol"]
+        obs = self._get_observation(self.current_step)
         signal, sl_mult, tp_mult, sent_exit_thresh, confidence = action.tolist()
         reward, done, info = 0.0, False, {}
-
-        # Drawdown check
+        
+        # Dynamic confidence threshold (starts low, increases with experience)
+        current_min_confidence = max(0.25, min(0.65, 0.25 + (self.episode_trades / 1000)))
+        
         dd_current = (self.initial_balance - self.balance) / self.initial_balance
         if dd_current >= DAILY_DD_LIMIT:
-            return self.observation, 0.0, True, info
+            return obs, reward, True, info
 
-        # TRADE ENTRY - Optimized correlation check
-        if (confidence >= 0.65 and len(self.open_positions) < MAX_OPEN_TRADES 
-                and symbol not in self.open_positions):
+        # TRADE ENTRY
+        if (confidence >= current_min_confidence and  # Dynamic threshold
+            len(self.open_positions) < MAX_OPEN_TRADES and
+            symbol not in self.open_positions):
             
-            t_cur = self.times[self.current_step]
-            h1_time = pd.Timestamp(t_cur).replace(minute=0, second=0, microsecond=0)
-            
+            t_cur = row["time"]
+            h1_time = t_cur.to_pydatetime().replace(minute=0, second=0, microsecond=0)
+
+            def get_last_h1_close_list(sym):
+                series = H1_CLOSES[sym]
+                prior = series[series.index <= h1_time]
+                return prior.values[-50:] if len(prior) >= 50 else prior.values
+
             skip_corr = False
             for open_sym in self.open_positions.keys():
-                # Get pre-stored numpy arrays
-                a1 = H1_CLOSES[symbol]
-                a2 = H1_CLOSES[open_sym]
-                
+                a1 = get_last_h1_close_list(symbol)
+                a2 = get_last_h1_close_list(open_sym)
                 if len(a1) >= 2 and len(a2) >= 2:
                     m = min(len(a1), len(a2))
                     if np.std(a1[-m:]) > 0 and np.std(a2[-m:]) > 0:
@@ -216,8 +193,10 @@ class ForexMultiEnv(gym.Env):
                     "sent_exit_thresh": sent_exit_thresh
                 }
                 self.last_entry_step[symbol] = self.current_step
+                self.episode_trades += 1
+                reward += 0.002  # Small reward for attempting a trade
 
-        # TRADE MANAGEMENT & EXIT - Optimized
+        # TRADE MANAGEMENT & EXIT
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             direction = pos["direction"]
@@ -227,61 +206,66 @@ class ForexMultiEnv(gym.Env):
             lot_size = pos["lot_size"]
             sent_thresh = pos["sent_exit_thresh"]
             pip_value = 0.01 if symbol.endswith("JPY") or symbol=="XAUUSD" else 0.0001
-            
             low, high, close_price = row["low"], row["high"], row["close"]
             pnl = 0.0
             closed = False
 
-            # Exit conditions
-            if ((direction == 1 and low <= sl_price) or 
-                (direction == -1 and high >= sl_price)):
+            # SL Hit
+            if (direction == 1 and low <= sl_price) or (direction == -1 and high >= sl_price):
                 exit_price = sl_price
                 pnl = (exit_price - entry_price) * direction * (lot_size / pip_value)
                 closed = True
-            elif ((direction == 1 and high >= tp_price) or 
-                  (direction == -1 and low <= tp_price)):
+
+            # TP Hit
+            elif (direction == 1 and high >= tp_price) or (direction == -1 and low <= tp_price):
                 exit_price = tp_price
                 pnl = (exit_price - entry_price) * direction * (lot_size / pip_value)
                 closed = True
-            elif ((direction == 1 and row["avg_sentiment"] <= sent_thresh) or 
-                  (direction == -1 and row["avg_sentiment"] >= sent_thresh)):
+
+            # Sentiment-based Exit
+            elif (direction == 1 and row["avg_sentiment"] <= sent_thresh) or \
+                 (direction == -1 and row["avg_sentiment"] >= sent_thresh):
                 exit_price = close_price
                 pnl = (exit_price - entry_price) * direction * (lot_size / pip_value)
                 closed = True
 
             if closed:
-                overtrade_penalty = abs(pnl) * 0.25 if (
-                    self.current_step - pos["entry_step"] < OVERTRADE_BARS) else 0.0
+                overtrade_penalty = abs(pnl) * 0.25 if (self.current_step - pos["entry_step"] < OVERTRADE_BARS) else 0.0
                 self.balance += pnl
-                
                 current_dd = (self.initial_balance - self.balance) / self.initial_balance
                 if current_dd > self.max_drawdown:
                     self.max_drawdown = current_dd
-                
                 drawdown_penalty = 1.7 * (-pnl if pnl < 0 else 0.0)
-                reward = pnl - overtrade_penalty - drawdown_penalty
+                reward += pnl - overtrade_penalty - drawdown_penalty
                 del self.open_positions[symbol]
 
-        # Advance step
+        # Small penalty for doing nothing
+        if len(self.open_positions) == 0 and random.random() < 0.1:
+            reward -= 0.001
+
+        # ADVANCE POINTER
         self.current_step += 1
         if self.current_step >= self.n_rows:
             done = True
             next_obs = np.zeros(self.observation_space.shape, dtype=np.float32)
         else:
             next_obs = self._get_observation(self.current_step)
-        
+
         info["balance"] = self.balance
         info["max_drawdown"] = self.max_drawdown
         info["open_positions"] = len(self.open_positions)
+        info["episode_trades"] = self.episode_trades
+        self.episode_reward += reward
         
         return next_obs, reward, done, info
 
     def _get_observation(self, step):
-        # Optimized observation generation
-        feat = self.features[step]
+        row = self.all_data.iloc[step]
+        symbol = row["symbol"]
+        feat = row.drop(labels=["time","symbol"]).values.astype(np.float32)
         scaled = self.scaler.transform(feat.reshape(1,-1)).flatten().astype(np.float32)
         symbol_id = np.zeros(len(SYMBOLS), dtype=np.float32)
-        symbol_id[self.symbol_to_id[SYMBOLS[self.symbols_data[step]]]] = 1.0
+        symbol_id[self.symbol_to_id[symbol]] = 1.0
         return np.concatenate([scaled, symbol_id])
 
     def render(self, mode="human"):
@@ -324,15 +308,19 @@ def train_agent():
     joblib.dump(env.scaler, scaler_path)
     print(f"✓ Scaler saved to {scaler_path}")
 
-    # Build models with GPU optimization
-    with tf.device('/GPU:0'):
-        actor = build_actor((1,) + env.observation_space.shape, env.action_space)
-        critic = build_critic((1,) + env.observation_space.shape, env.action_space)
+    # Build models
+    actor = build_actor((1,) + env.observation_space.shape, env.action_space)
+    critic = build_critic((1,) + env.observation_space.shape, env.action_space)
 
-    # Configure agent
+    # Configure agent with more exploration
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
     random_process = OrnsteinUhlenbeckProcess(
-        size=nb_actions, theta=0.15, mu=0.0, sigma=0.2)
+        size=nb_actions,
+        theta=0.25,  # Increased from 0.15 for faster adaptation
+        mu=0.0,
+        sigma=0.3,  # Increased from 0.2 for more exploration
+        sigma_min=0.05  # Minimum noise
+    )
 
     agent = DDPGAgent(
         nb_actions=nb_actions,
@@ -340,8 +328,8 @@ def train_agent():
         critic=critic,
         critic_action_input=critic.input[1],
         memory=memory,
-        nb_steps_warmup_critic=1000,
-        nb_steps_warmup_actor=1000,
+        nb_steps_warmup_critic=5000,  # Increased from 1000
+        nb_steps_warmup_actor=5000,   # Increased from 1000
         random_process=random_process,
         gamma=DISCOUNT_FACTOR,
         target_model_update=1e-3,
@@ -350,30 +338,19 @@ def train_agent():
 
     agent.compile(Adam(learning_rate=1e-4, clipnorm=1.0), metrics=["mae"])
 
-    # Train with progress callback
-    print(f"\n▶ Starting training for {TRAIN_STEPS} steps...")
-    print(" Progress will be shown every 60 seconds")
-    
-    try:
-        agent.fit(
-            env, 
-            nb_steps=TRAIN_STEPS, 
-            visualize=False, 
-            verbose=2,
-            nb_max_episode_steps=env.n_rows
-        )
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
+    # Train
+    print(f"\n▶ Starting training for {TRAIN_STEPS} steps (this will take hours)...")
+    print(" Progress will be shown as 'episode/reward/balance' updates")
+    agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=2, nb_max_episode_steps=env.n_rows)
 
     # Save models
     actor_path = os.path.join(MODEL_DIR, "actor_model.h5")
     critic_path = os.path.join(MODEL_DIR, "critic_model.h5")
     weights_path = os.path.join(MODEL_DIR, "ddpg_weights.h5f")
-    
     actor.save(actor_path)
     critic.save_weights(critic_path)
     agent.save_weights(weights_path, overwrite=True)
-    
+
     print("\n✓ Training complete! Saved models:")
     print(f"- Actor: {actor_path}")
     print(f"- Critic: {critic_path}")
@@ -390,4 +367,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\n⚠️ Training failed: {str(e)}")
         print("Check your data files and GPU availability")
-        raise
