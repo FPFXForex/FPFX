@@ -131,6 +131,8 @@ class ForexMultiEnv(gym.Env):
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
         
+        # Initialize balance (FIX ADDED HERE)
+        self.initial_balance = initial_balance
         self.reset()
         
         # Debug stats
