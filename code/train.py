@@ -72,6 +72,10 @@ def load_all_data():
     all_df["news_count"] = all_df["news_count"].fillna(0)
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
     all_df.drop(columns=["date"], inplace=True)
+
+    # ===== FIX: fill any remaining NaNs in feature columns =====
+    all_df.fillna(0, inplace=True)
+
     return all_df
 
 ALL_DATA = load_all_data()
@@ -151,15 +155,14 @@ class ForexMultiEnv(gym.Env):
         # —— DEBUG LOGGING ADDED HERE ——
         print(f"[DEBUG ENTRY] Step {self.current_step} | Symbol {symbol} | "
               f"Conf {confidence:.3f} vs Min {current_min_confidence:.3f} | "
-              f"OpenPos {len(self.open_positions)} | "
-              f"ATR {row['ATR_14']:.6f}")
+              f"OpenPos {len(self.open_positions)} | ATR {row['ATR_14']:.6f}")
         # ————————————————————————
 
         if dd_current >= DAILY_DD_LIMIT:
             return obs, reward, True, info
 
         # TRADE ENTRY
-        if (confidence >= current_min_confidence and  # Dynamic threshold
+        if (confidence >= current_min_confidence and
             len(self.open_positions) < MAX_OPEN_TRADES and
             symbol not in self.open_positions):
 
@@ -273,7 +276,7 @@ class ForexMultiEnv(gym.Env):
         info["open_positions"] = len(self.open_positions)
         info["episode_trades"] = self.episode_trades
 
-        # Progress reporting every 60 seconds
+        # Progress reporting every 60 seconds (UNCHANGED)
         current_time = time.time()
         if current_time - self.last_progress_report >= 60:
             progress = (self.current_step / self.n_rows) * 100
