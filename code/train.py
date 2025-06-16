@@ -31,6 +31,10 @@ from rl.random import OrnsteinUhlenbeckProcess
 # FIX 1: Use legacy Adam optimizer for Keras-RL2 compatibility
 from tensorflow.keras.optimizers.legacy import Adam
 
+print("TF Version:", tf.__version__)
+print("GPU Available:", tf.config.list_physical_devices('GPU'))
+tf.debugging.set_log_device_placement(True)  # Log GPU operations
+
 # ========== 1) GLOBAL CONFIGURATION ==========
 SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
 
