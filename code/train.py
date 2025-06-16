@@ -148,6 +148,13 @@ class ForexMultiEnv(gym.Env):
         current_min_confidence = max(0.25, min(0.65, 0.25 + (self.episode_trades / 1000)))
         dd_current = (self.initial_balance - self.balance) / self.initial_balance
 
+        # —— DEBUG LOGGING ADDED HERE ——
+        print(f"[DEBUG ENTRY] Step {self.current_step} | Symbol {symbol} | "
+              f"Conf {confidence:.3f} vs Min {current_min_confidence:.3f} | "
+              f"OpenPos {len(self.open_positions)} | "
+              f"ATR {row['ATR_14']:.6f}")
+        # ————————————————————————
+
         if dd_current >= DAILY_DD_LIMIT:
             return obs, reward, True, info
 
