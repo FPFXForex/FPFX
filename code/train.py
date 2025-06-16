@@ -46,6 +46,7 @@ DAILY_DD_LIMIT = 0.08
 MIN_RISK = 0.01
 MAX_RISK = 0.02
 LOG_INTERVAL = 30  # seconds
+MAX_LOT_SIZE = 100.0  # hard cap on lot size
 
 # ========== 2) DATA LOADING ==========
 def load_all_data():
@@ -129,7 +130,7 @@ class ForexMultiEnv(gym.Env):
         self.episode_trades = 0
         self.episode_reward = 0
         self.total_trades = 0
-        self.completed_trades = []  # track recently closed trades
+        self.completed_trades = []  # track completed trades
         self.last_progress_report = time.time()
 
         # prepare trade log file
@@ -199,12 +200,20 @@ class ForexMultiEnv(gym.Env):
                             break
 
             if not skip_corr:
+                # Use initial_balance to prevent runaway leverage
                 risk_pct = MIN_RISK + confidence * (MAX_RISK - MIN_RISK)
-                risk_amount = risk_pct * self.balance
+                risk_amount = risk_pct * self.initial_balance
                 atr = row["ATR_14"] if row["ATR_14"] > 0 else 1e-6
                 pip_value = 0.01 if symbol.endswith("JPY") or symbol == "XAUUSD" else 0.0001
                 sl_pips = atr * sl_mult if atr * sl_mult > 0 else atr
-                lot_size = max(risk_amount / (sl_pips / pip_value), 0.01)
+                raw_lot_size = risk_amount / (sl_pips / pip_value)
+                # cap lot size
+                lot_size = float(min(max(raw_lot_size, 0.01), MAX_LOT_SIZE))
+
+                # debug log for lot sizing
+                print(f"[DEBUG LOT] {symbol} | risk_amt={risk_amount:.2f} | "
+                      f"sl_pips={sl_pips:.6f} | pip_value={pip_value} | "
+                      f"raw_lot={raw_lot_size:.2f} | capped_lot={lot_size:.2f}")
 
                 direction = 1 if signal >= 0.5 else -1
                 entry_price = row["open"]
@@ -270,16 +279,15 @@ class ForexMultiEnv(gym.Env):
                 drawdown_penalty = 1.7 * (-pnl if pnl < 0 else 0.0)
                 reward += pnl - overtrade_penalty - drawdown_penalty
 
-                # record completed trade
+                # record and log completed trade
                 trade = {
                     "symbol": symbol,
                     "entry_step": pos["entry_step"],
                     "exit_step": self.current_step,
-                    "lot_size": pos["lot_size"],
+                    "lot_size": lot_size,
                     "pnl": pnl
                 }
                 self.completed_trades.append(trade)
-                # append to CSV log
                 with open(self.trade_log_path, mode="a", newline="") as f:
                     writer = csv.writer(f)
                     writer.writerow([trade["symbol"],
@@ -287,7 +295,6 @@ class ForexMultiEnv(gym.Env):
                                      trade["exit_step"],
                                      f"{trade['lot_size']:.2f}",
                                      f"{trade['pnl']:.2f}"])
-
                 del self.open_positions[symbol]
 
         # Small penalty for doing nothing
@@ -348,7 +355,6 @@ def build_actor(input_shape, action_space):
     x = Dense(256, activation="relu")(x)
     x = Dense(128, activation="relu")(x)
     raw_actions = Dense(action_space.shape[0], activation="sigmoid", name="raw_actions")(x)
-
     lb, hb = action_space.low, action_space.high
     actions = tf.keras.layers.Lambda(lambda x: x*(hb-lb)+lb, name="actions")(raw_actions)
     return Model(inputs=state_input, outputs=actions)
@@ -357,7 +363,6 @@ def build_critic(input_shape, action_space):
     state_input = Input(shape=input_shape, name="state_input")
     x = Flatten()(state_input)
     action_input = Input(shape=(action_space.shape[0],), name="action_input")
-
     xs = Dense(256, activation="relu")(x)
     xa = Concatenate()([xs, action_input])
     x = Dense(256, activation="relu")(xa)
@@ -382,27 +387,13 @@ def train_agent():
 
     # Configure agent
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
-    random_process = OrnsteinUhlenbeckProcess(
-        size=nb_actions,
-        theta=0.25,
-        mu=0.0,
-        sigma=0.3,
-        sigma_min=0.05
-    )
+    random_process = OrnsteinUhlenbeckProcess(size=nb_actions, theta=0.25, mu=0.0, sigma=0.3, sigma_min=0.05)
 
-    agent = DDPGAgent(
-        nb_actions=nb_actions,
-        actor=actor,
-        critic=critic,
-        critic_action_input=critic.input[1],
-        memory=memory,
-        nb_steps_warmup_critic=5000,
-        nb_steps_warmup_actor=5000,
-        random_process=random_process,
-        gamma=DISCOUNT_FACTOR,
-        target_model_update=1e-3,
-        batch_size=BATCH_SIZE,
-    )
+    agent = DDPGAgent(nb_actions=nb_actions, actor=actor, critic=critic,
+                      critic_action_input=critic.input[1], memory=memory,
+                      nb_steps_warmup_critic=5000, nb_steps_warmup_actor=5000,
+                      random_process=random_process, gamma=DISCOUNT_FACTOR,
+                      target_model_update=1e-3, batch_size=BATCH_SIZE)
     agent.compile(Adam(learning_rate=1e-4, clipnorm=1.0), metrics=["mae"])
 
     # Train
@@ -423,18 +414,16 @@ def train_agent():
     print(f"Final balance: ${env.balance:,.2f}")
     print(f"Total trades: {env.total_trades}")
     print(f"Max drawdown: {env.max_drawdown * 100:.2f}%")
+    print(f"✓ Trade log written to {env.trade_log_path}")
     print("\n✓ Training complete! Saved models:")
     print(f"- Actor: {actor_path}")
     print(f"- Critic: {critic_path}")
     print(f"- Weights: {weights_path}")
-    print(f"✓ Trade log written to {env.trade_log_path}")
 
 if __name__ == "__main__":
-    # GPU configuration
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
         tf.config.experimental.set_memory_growth(physical_devices[0], True)
-
     try:
         train_agent()
     except Exception as e:
