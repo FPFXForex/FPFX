@@ -155,7 +155,8 @@ class ForexMultiEnv(gym.Env):
         # —— DEBUG LOGGING ADDED HERE ——
         print(f"[DEBUG ENTRY] Step {self.current_step} | Symbol {symbol} | "
               f"Conf {confidence:.3f} vs Min {current_min_confidence:.3f} | "
-              f"OpenPos {len(self.open_positions)} | ATR {row['ATR_14']:.6f}")
+              f"OpenPos {len(self.open_positions)} | ATR {row['ATR_14']:.6f} | "
+              f"Bal {self.balance:.2f}")
         # ————————————————————————
 
         if dd_current >= DAILY_DD_LIMIT:
@@ -381,6 +382,13 @@ def train_agent():
     actor.save(actor_path)
     critic.save_weights(critic_path)
     agent.save_weights(weights_path, overwrite=True)
+
+    # ===== ADD: final training summary =====
+    print("\n=== Training Summary ===")
+    print(f"Final balance: ${env.balance:,.2f}")
+    print(f"Total trades: {env.total_trades}")
+    print(f"Max drawdown: {env.max_drawdown * 100:.2f}%")
+    # ================================
 
     print("\n✓ Training complete! Saved models:")
     print(f"- Actor: {actor_path}")
