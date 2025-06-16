@@ -1,0 +1,15 @@
+# Python venv
+venv/
+*/venv/
+
+# Bytecode
+__pycache__/
+*.py[cod]
+
+# Large model/artifacts if you use LFS instead
+*.h5
+*.pkl
+*.h5f
+
+# System files
+.DS_Store
