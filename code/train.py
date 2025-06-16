@@ -2,6 +2,7 @@
 
 import os
 import math
+import random  # Added this import
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
@@ -239,7 +240,7 @@ class ForexMultiEnv(gym.Env):
                 reward += pnl - overtrade_penalty - drawdown_penalty
                 del self.open_positions[symbol]
 
-        # Small penalty for doing nothing
+        # Small penalty for doing nothing (only applied 10% of the time)
         if len(self.open_positions) == 0 and random.random() < 0.1:
             reward -= 0.001
 
