@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 import joblib
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Concatenate, Flatten
+from tensorflow.keras.layers import Input, Dense, Concatenate, Flatten, Lambda
 import tensorflow as tf
 import gym
 from gym import spaces
@@ -117,6 +117,11 @@ class ForexMultiEnv(gym.Env):
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
 
+        # for controlling forced-first-trade
+        self.forced_first_trade = False
+        # for periodic summaries
+        self.last_summary_time = time.time()
+
         self.reset()
 
     def reset(self):
@@ -142,11 +147,15 @@ class ForexMultiEnv(gym.Env):
             action, self.action_space.low, self.action_space.high
         )
 
+        # Force just the first trade once
         self.force_trade_counter += 1
-        if self.total_trades == 0 and self.force_trade_counter >= 3000:
+        if (not self.forced_first_trade and self.total_trades == 0
+                and self.force_trade_counter >= 3000):
             confidence = max(confidence, 0.5)
+            self.forced_first_trade = True
             print(f"\n!!! FORCING FIRST TRADE AT STEP {self.current_step} !!!")
 
+        # TRADE ENTRY
         if (confidence >= FIXED_CONFIDENCE_THRESHOLD and
             len(self.open_positions) < MAX_OPEN_TRADES and
             symbol not in self.open_positions):
@@ -169,9 +178,9 @@ class ForexMultiEnv(gym.Env):
             self.episode_trades += 1
             self.total_trades += 1
             print(f"\n[TRADE] {'LONG' if direction==1 else 'SHORT'} {symbol} "
-                  f"@{row['open']:.5f} (Size: {lot_size:.2f} lots, "
-                  f"ATR: {atr:.5f}, SL: {atr*sl_mult:.5f})")
+                  f"@{row['open']:.5f} (Size: {lot_size:.2f} lots, ATR: {atr:.5f}, SL: {atr*sl_mult:.5f})")
 
+        # TRADE EXIT
         reward = 0
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
@@ -190,23 +199,25 @@ class ForexMultiEnv(gym.Env):
                 exit_price = row["close"]
                 exit_reason = "SENT"
 
-            if exit_price:
+            if exit_price is not None:
                 pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
                 pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
                 self.balance += pnl
                 reward = pnl
                 del self.open_positions[symbol]
-                print(f"[EXIT] {symbol} @ {exit_price:.5f} ({exit_reason}) "
-                      f"| PnL: ${pnl:+.2f}")
+                print(f"[EXIT] {symbol} @ {exit_price:.5f} ({exit_reason}) | PnL: ${pnl:+.2f}")
 
         self.current_step += 1
         done = self.current_step >= self.n_rows
         next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
 
-        if self.current_step % 5000 == 0:
-            print(f"\n[Progress] Step: {self.current_step}/{self.n_rows} | "
+        # periodic summary every 30 seconds
+        if time.time() - self.last_summary_time >= 30:
+            print(f"\n[SUMMARY] Step {self.current_step}/{self.n_rows} | "
                   f"Balance: ${self.balance:,.2f} | "
-                  f"Trades: {self.total_trades}")
+                  f"Open Trades: {len(self.open_positions)} | "
+                  f"Total Trades: {self.total_trades}")
+            self.last_summary_time = time.time()
 
         return next_obs, reward, done, {"balance": self.balance}
 
@@ -225,10 +236,10 @@ def build_actor(input_shape, action_space):
     x = Dense(256, activation="relu")(x)
     x = Dense(128, activation="relu")(x)
     raw_actions = Dense(action_space.shape[0], activation="sigmoid", name="raw_actions")(x)
-    actions = tf.keras.layers.Lambda(
-        lambda x: x * (action_space.high - action_space.low) + action_space.low,
-        name="actions"
-    )(raw_actions)
+    # capture only NumPy arrays in closure for JSON serialization
+    diff = action_space.high - action_space.low
+    low  = action_space.low
+    actions = Lambda(lambda x, d=diff, l=low: x * d + l, name="actions")(raw_actions)
     return Model(inputs=state_input, outputs=actions)
 
 def build_critic(input_shape, action_space):
