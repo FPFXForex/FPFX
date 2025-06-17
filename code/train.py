@@ -10,6 +10,11 @@ from tensorflow.keras.layers import Input, Dense, Concatenate, Flatten, Lambda
 import tensorflow as tf
 import gym
 from gym import spaces
+
+# ===== Monkey-patch to avoid `len(actor.output)` TypeError in keras-rl DDPGAgent =====
+from keras.engine.keras_tensor import KerasTensor
+KerasTensor.__len__ = lambda self: 1
+
 from rl.agents import DDPGAgent
 from rl.memory import SequentialMemory
 from rl.random import OrnsteinUhlenbeckProcess
