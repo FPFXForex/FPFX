@@ -112,7 +112,7 @@ class ForexMultiEnv(gym.Env):
 
         self.initial_balance = initial_balance
 
-        # FIXED: scaler initialized before reset
+        # scaler initialized before reset
         self.features = self.all_data[feature_cols].values
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
@@ -261,7 +261,8 @@ def train_agent():
         critic=critic,
         critic_action_input=critic.input[1],
         memory=memory,
-        nb_steps_warmup=10000,
+        nb_steps_warmup_actor=10000,
+        nb_steps_warmup_critic=10000,
         random_process=random_process,
         gamma=DISCOUNT_FACTOR,
         target_model_update=1e-3,
