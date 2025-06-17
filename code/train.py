@@ -83,6 +83,12 @@ def load_all_data():
     all_df = all_df.merge(news, how="left", on=["date", "symbol"])
     all_df["news_count"] = all_df["news_count"].fillna(0)
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
+
+    # ===== NEW FIX: fill any remaining NaNs in technical features =====
+    all_df.fillna(method="ffill", inplace=True)
+    all_df.fillna(0.0, inplace=True)
+    # ===============================================================
+
     return all_df
 
 ALL_DATA = load_all_data()
