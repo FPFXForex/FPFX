@@ -1,5 +1,6 @@
 import os
 import random
+import glob
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -22,6 +23,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed")
 NEWS_CSV = os.path.join(BASE_DIR, "Data", "news_cache.csv")
 MODEL_DIR = os.path.join(BASE_DIR, "model")
+CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Hyperparameters
@@ -327,6 +330,26 @@ def build_critic(input_shape, action_space):
     q_value = Dense(1, activation="linear", name="q_value")(x)
     return Model(inputs=[state_input, action_input], outputs=q_value)
 
+# ========== CHECKPOINT CALLBACK ==========
+class CheckpointSaver(Callback):
+    def __init__(self, save_path, interval=50000):
+        super().__init__()
+        self.save_path = save_path
+        self.interval = interval
+        os.makedirs(self.save_path, exist_ok=True)
+
+    def on_step_end(self, step, logs={}):
+        if step % self.interval == 0 and step > 0:
+            filename = os.path.join(self.save_path, f"ddpg_weights_step_{step}.h5f")
+            self.model.save_weights(filename, overwrite=True)
+            print(f"\n[SAVED] Weights checkpoint at step {step} ➝ {filename}")
+
+def get_latest_checkpoint(path):
+    checkpoints = glob.glob(os.path.join(path, "ddpg_weights_step_*.h5f"))
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=os.path.getmtime)
+
 # ========== TRAINING ==========
 def train_agent():
     env = ForexMultiEnv(ALL_DATA)
@@ -356,8 +379,15 @@ def train_agent():
     
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
     
+    # Attempt to resume from latest checkpoint
+    latest = get_latest_checkpoint(CHECKPOINT_DIR)
+    if latest:
+        print(f"\n[RESUMING] Loading weights from: {latest}")
+        agent.load_weights(latest)
+    
     print("\nStarting training...")
-    agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=1)
+    callbacks = [CheckpointSaver(save_path=CHECKPOINT_DIR, interval=50000)]
+    agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=1, callbacks=callbacks)
     
     # ========== EVALUATION ==========
     print("\n=== EVALUATING LEARNED POLICY ===")
@@ -371,7 +401,6 @@ def train_agent():
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
     
-    # Save training stats
     stats = {
         "total_episodes": eval_env.current_episode,
         "final_balance": eval_env.balance,
