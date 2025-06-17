@@ -105,8 +105,8 @@ class ForexMultiEnv(gym.Env):
         )
 
         self.action_space = spaces.Box(
-            low=np.array([0.0, 1.0, 1.0, -0.1, 0.0]),
-            high=np.array([1.0, 10.0, 10.0, 0.1, 1.0]),
+            low=np.array([0.0, 1.0, 1.0, -0.1, 0.0], dtype=np.float32),
+            high=np.array([1.0, 10.0, 10.0, 0.1, 1.0], dtype=np.float32),
             dtype=np.float32
         )
 
@@ -117,9 +117,9 @@ class ForexMultiEnv(gym.Env):
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
 
-        # first‐trade flag & periodic summary timer
+        # first‐trade flag, genuine trade logger & summary timer
         self.forced_first_trade = False
-        self.first_real_trade_logged = False         # ← NEW FLAG
+        self.first_real_trade_logged = False
         self.last_summary_time = time.time()
 
         self.reset()
@@ -276,8 +276,8 @@ def train_agent():
         critic=critic,
         critic_action_input=critic.input[1],
         memory=memory,
-        nb_steps_warmup_actor=0,
-        nb_steps_warmup_critic=0,
+        nb_steps_warmup_actor=1000,
+        nb_steps_warmup_critic=1000,
         random_process=random_process,
         gamma=DISCOUNT_FACTOR,
         target_model_update=1e-3,
