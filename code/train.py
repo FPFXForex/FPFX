@@ -152,6 +152,9 @@ class ForexMultiEnv(gym.Env):
             action, self.action_space.low, self.action_space.high
         )
 
+        # ==== DEBUG: log confidence and open positions ====
+        print(f"[DEBUG] Confidence: {confidence:.4f} | Symbol: {symbol} | Open positions: {len(self.open_positions)}")
+
         # Force just the first trade once
         self.force_trade_counter += 1
         if (not self.forced_first_trade and self.total_trades == 0
@@ -189,6 +192,7 @@ class ForexMultiEnv(gym.Env):
             self.total_trades += 1
             print(f"\n[TRADE] {'LONG' if direction==1 else 'SHORT'} {symbol} "
                   f"@{row['open']:.5f} (Size: {lot_size:.2f} lots, ATR: {atr:.5f}, SL: {atr*sl_mult:.5f})")
+            print(f"[TRADE] >>> Successfully placed trade at step {self.current_step} | Total Trades: {self.total_trades}")
 
         # TRADE EXIT
         reward = 0
