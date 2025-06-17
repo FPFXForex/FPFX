@@ -31,10 +31,11 @@ MEMORY_LIMIT = 1000000
 BATCH_SIZE = 64
 OVERTRADE_BARS = 12
 MAX_OPEN_TRADES = 3
-DAILY_DD_LIMIT = 1.0
-MIN_RISK = 0.01
-MAX_RISK = 0.02
+DAILY_DD_LIMIT = 0.2  # Reduced from 1.0 to 20% max daily drawdown
+MIN_RISK = 0.005      # Reduced from 0.01
+MAX_RISK = 0.01       # Reduced from 0.02
 FIXED_CONFIDENCE_THRESHOLD = 0.0  # exploration during training
+MIN_LOT_SIZE = 0.1    # Minimum viable lot size
 
 # ========== DATA LOADING ==========
 def load_all_data():
@@ -115,6 +116,7 @@ class ForexMultiEnv(gym.Env):
         )
 
         self.initial_balance = initial_balance
+        self.current_episode = 0
 
         # scaler
         self.features = self.all_data[feature_cols].values
@@ -143,6 +145,7 @@ class ForexMultiEnv(gym.Env):
         self.force_trade_counter = 0
         self.recent_trades.clear()
         self.recent_exits.clear()
+        self.current_episode += 1
         return self._get_observation(self.current_step)
 
     def step(self, action):
@@ -157,6 +160,14 @@ class ForexMultiEnv(gym.Env):
         signal, sl_mult, tp_mult, sent_exit_thresh, confidence = np.clip(
             action, self.action_space.low, self.action_space.high
         )
+
+        # Clip balance at $0 to prevent negative values
+        self.balance = max(0, self.balance)
+        
+        # Early reset if balance is too low
+        if self.balance < 1000:  # Reset if balance < $1k
+            print(f"\n[EARLY RESET] Episode {self.current_episode} | Balance: ${self.balance:.2f}")
+            return self.reset(), 0, True, {"early_reset": True}
 
         # force first trade
         self.force_trade_counter += 1
@@ -174,8 +185,21 @@ class ForexMultiEnv(gym.Env):
 
             atr = row["ATR_14"]
             pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
-            risk_amount = (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance
-            lot_size = max(risk_amount / (atr * sl_mult / pip_value), 0.01)
+            
+            # Adjusted risk calculation with minimum floor
+            risk_amount = max(
+                MIN_RISK * self.balance,
+                (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance
+            )
+            
+            # Calculate lot size with minimum enforcement
+            lot_size = max(risk_amount / (atr * sl_mult / pip_value), MIN_LOT_SIZE)
+            
+            # Skip trade if lot size is too small
+            if lot_size < MIN_LOT_SIZE:
+                self.current_step += 1
+                return self._get_observation(self.current_step), 0, False, {}
+
             direction = 1 if signal >= 0.5 else -1
 
             # record entry
@@ -212,20 +236,22 @@ class ForexMultiEnv(gym.Env):
                 (pos["direction"] == -1 and row["high"] >= pos["sl_price"])):
                 exit_price = pos["sl_price"]
                 exit_reason = "SL"
+                reward = -abs(pos["lot_size"] * 2)  # Strong penalty for SL hits
             elif ((pos["direction"] == 1 and row["high"] >= pos["tp_price"]) or
                   (pos["direction"] == -1 and row["low"] <= pos["tp_price"])):
                 exit_price = pos["tp_price"]
                 exit_reason = "TP"
+                reward = pos["lot_size"]  # Reward proportional to position size
             elif ((pos["direction"] == 1 and row["avg_sentiment"] <= pos["sent_exit_thresh"]) or
                   (pos["direction"] == -1 and row["avg_sentiment"] >= pos["sent_exit_thresh"])):
                 exit_price = row["close"]
                 exit_reason = "SENT"
+                reward = 0  # Neutral reward for sentiment exits
 
             if exit_price is not None:
                 pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
                 pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
                 self.balance += pnl
-                reward = pnl
 
                 self.recent_exits.append({
                     "symbol": symbol,
@@ -244,7 +270,7 @@ class ForexMultiEnv(gym.Env):
 
         # periodic summary every 30 seconds
         if time.time() - self.last_summary_time >= 30:
-            print(f"\n[SUMMARY] Step {self.current_step}/{self.n_rows} | Balance: ${self.balance:,.2f} | Total Trades: {self.total_trades}")
+            print(f"\n[SUMMARY] Episode {self.current_episode} | Step {self.current_step}/{self.n_rows} | Balance: ${self.balance:,.2f} | Total Trades: {self.total_trades}")
             if self.recent_trades:
                 print("  Recent Entries:")
                 for t in self.recent_trades:
@@ -301,7 +327,7 @@ def train_agent():
 
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
     random_process = OrnsteinUhlenbeckProcess(
-        size=nb_actions, theta=0.3, mu=0.0, sigma=0.4, sigma_min=0.1
+        size=nb_actions, theta=0.15, mu=0.0, sigma=0.2, sigma_min=0.05  # Reduced noise
     )
 
     agent = DDPGAgent(
@@ -329,10 +355,18 @@ def train_agent():
 
     eval_env = ForexMultiEnv(ALL_DATA)
     eval_env.reset()
-    agent.test(eval_env, nb_episodes=1, visualize=False)
+    agent.test(eval_env, nb_episodes=5, visualize=False)  # Increased to 5 episodes for better stats
 
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
+
+    # Save training stats
+    stats = {
+        "total_episodes": eval_env.current_episode,
+        "final_balance": eval_env.balance,
+        "total_trades": eval_env.total_trades
+    }
+    joblib.dump(stats, os.path.join(MODEL_DIR, "training_stats.pkl"))
 
 if __name__ == "__main__":
     train_agent()
