@@ -136,6 +136,11 @@ class ForexMultiEnv(gym.Env):
         return self._get_observation(self.current_step)
 
     def step(self, action):
+        # ==== DEBUG: inspect first few rows ====
+        if self.current_step < 10:
+            row = self.all_data.iloc[self.current_step]
+            print(f"[DEBUG] Step {self.current_step} | Symbol={row['symbol']} | high={row['high']} low={row['low']}")
+
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
 
