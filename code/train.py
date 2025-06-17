@@ -44,7 +44,7 @@ MAX_OPEN_TRADES = 3
 DAILY_DD_LIMIT = 1.0  # 100% drawdown allowed during training
 MIN_RISK = 0.01
 MAX_RISK = 0.02
-FIXED_CONFIDENCE_THRESHOLD = 0.01  # Very low confidence threshold for training
+FIXED_CONFIDENCE_THRESHOLD = 0.10  # Very low confidence threshold for training
 
 # ========== 2) DATA LOADING ==========
 def load_all_data():
