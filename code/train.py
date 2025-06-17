@@ -57,7 +57,6 @@ def load_all_data():
         news = pd.read_csv(NEWS_CSV, parse_dates=["date"])
         if news["date"].dt.tz is None:
             news["date"] = news["date"].dt.tz_localize('UTC')
-
         all_dates = pd.date_range(
             start=all_df["time"].min().floor("D"),
             end=all_df["time"].max().ceil("D"),
@@ -84,10 +83,9 @@ def load_all_data():
     all_df["news_count"] = all_df["news_count"].fillna(0)
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
 
-    # ===== NEW FIX: fill any remaining NaNs in technical features =====
+    # Fill any remaining NaNs
     all_df.fillna(method="ffill", inplace=True)
     all_df.fillna(0.0, inplace=True)
-    # ===============================================================
 
     return all_df
 
@@ -118,14 +116,18 @@ class ForexMultiEnv(gym.Env):
 
         self.initial_balance = initial_balance
 
-        # scaler initialized before reset
+        # scaler
         self.features = self.all_data[feature_cols].values
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
 
-        # first‐trade flag, genuine trade logger & summary timer
+        # state
         self.forced_first_trade = False
         self.first_real_trade_logged = False
+
+        # track recent trades/exits for summary
+        self.recent_trades = []
+        self.recent_exits = []
         self.last_summary_time = time.time()
 
         self.reset()
@@ -139,17 +141,15 @@ class ForexMultiEnv(gym.Env):
         self.episode_trades = 0
         self.total_trades = 0
         self.force_trade_counter = 0
+        self.recent_trades.clear()
+        self.recent_exits.clear()
         return self._get_observation(self.current_step)
 
     def step(self, action):
-        # ==== DEBUG: inspect first few rows ====
-        if self.current_step < 10:
-            row = self.all_data.iloc[self.current_step]
-            print(f"[DEBUG] Step {self.current_step} | Symbol={row['symbol']} | high={row['high']} low={row['low']}")
-
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
 
+        # skip bad data
         if row["high"] <= row["low"]:
             self.current_step += 1
             return self._get_observation(self.current_step), 0, False, {}
@@ -158,26 +158,19 @@ class ForexMultiEnv(gym.Env):
             action, self.action_space.low, self.action_space.high
         )
 
-        # ==== DEBUG: log confidence and open positions ====
-        print(f"[DEBUG] Confidence: {confidence:.4f} | Symbol: {symbol} | Open positions: {len(self.open_positions)}")
-
-        # Force just the first trade once
+        # force first trade
         self.force_trade_counter += 1
         if (not self.forced_first_trade and self.total_trades == 0
                 and self.force_trade_counter >= 3000):
             confidence = max(confidence, 0.5)
             self.forced_first_trade = True
-            print(f"\n!!! FORCING FIRST TRADE AT STEP {self.current_step} !!!")
+
+        reward = 0
 
         # TRADE ENTRY
         if (confidence >= FIXED_CONFIDENCE_THRESHOLD and
             len(self.open_positions) < MAX_OPEN_TRADES and
             symbol not in self.open_positions):
-
-            # <<< LOG FIRST REAL TRADE >>>
-            if not self.forced_first_trade and self.total_trades == 0 and not self.first_real_trade_logged:
-                print(f"\n>>> FIRST GENUINE TRADE at step {self.current_step} | Confidence: {confidence:.4f}")
-                self.first_real_trade_logged = True
 
             atr = row["ATR_14"]
             pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
@@ -185,6 +178,7 @@ class ForexMultiEnv(gym.Env):
             lot_size = max(risk_amount / (atr * sl_mult / pip_value), 0.01)
             direction = 1 if signal >= 0.5 else -1
 
+            # record entry
             self.open_positions[symbol] = {
                 "direction": direction,
                 "entry_price": row["open"],
@@ -192,16 +186,24 @@ class ForexMultiEnv(gym.Env):
                 "tp_price": row["open"] + direction * atr * tp_mult,
                 "lot_size": lot_size,
                 "entry_step": self.current_step,
-                "sent_exit_thresh": sent_exit_thresh
+                "sent_exit_thresh": sent_exit_thresh,
+                "confidence": confidence
             }
             self.episode_trades += 1
             self.total_trades += 1
-            print(f"\n[TRADE] {'LONG' if direction==1 else 'SHORT'} {symbol} "
-                  f"@{row['open']:.5f} (Size: {lot_size:.2f} lots, ATR: {atr:.5f}, SL: {atr*sl_mult:.5f})")
-            print(f"[TRADE] >>> Successfully placed trade at step {self.current_step} | Total Trades: {self.total_trades}")
+
+            self.recent_trades.append({
+                "symbol": symbol,
+                "direction": "LONG" if direction == 1 else "SHORT",
+                "entry_price": row["open"],
+                "sl_price": row["open"] - direction * atr * sl_mult,
+                "tp_price": row["open"] + direction * atr * tp_mult,
+                "lot_size": lot_size,
+                "ATR": atr,
+                "confidence": confidence
+            })
 
         # TRADE EXIT
-        reward = 0
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
@@ -224,19 +226,36 @@ class ForexMultiEnv(gym.Env):
                 pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
                 self.balance += pnl
                 reward = pnl
-                del self.open_positions[symbol]
-                print(f"[EXIT] {symbol} @ {exit_price:.5f} ({exit_reason}) | PnL: ${pnl:+.2f}")
 
+                self.recent_exits.append({
+                    "symbol": symbol,
+                    "exit_price": exit_price,
+                    "reason": exit_reason,
+                    "pnl": pnl,
+                    "confidence": pos["confidence"]
+                })
+
+                del self.open_positions[symbol]
+
+        # advance step
         self.current_step += 1
         done = self.current_step >= self.n_rows
         next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
 
         # periodic summary every 30 seconds
         if time.time() - self.last_summary_time >= 30:
-            print(f"\n[SUMMARY] Step {self.current_step}/{self.n_rows} | "
-                  f"Balance: ${self.balance:,.2f} | "
-                  f"Open Trades: {len(self.open_positions)} | "
-                  f"Total Trades: {self.total_trades}")
+            print(f"\n[SUMMARY] Step {self.current_step}/{self.n_rows} | Balance: ${self.balance:,.2f} | Total Trades: {self.total_trades}")
+            if self.recent_trades:
+                print("  Recent Entries:")
+                for t in self.recent_trades:
+                    print(f"   • {t['direction']} {t['symbol']} @ {t['entry_price']:.5f} | Size: {t['lot_size']:.2f} | ATR: {t['ATR']:.5f} | SL: {t['sl_price']:.5f} | TP: {t['tp_price']:.5f} | Conf: {t['confidence']:.4f}")
+            if self.recent_exits:
+                print("  Recent Exits:")
+                for e in self.recent_exits:
+                    print(f"   • {e['symbol']} exited @ {e['exit_price']:.5f} ({e['reason']}) | PnL: ${e['pnl']:+.2f} | Conf: {e['confidence']:.4f}")
+            # clear for next interval
+            self.recent_trades.clear()
+            self.recent_exits.clear()
             self.last_summary_time = time.time()
 
         return next_obs, reward, done, {"balance": self.balance}
