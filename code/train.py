@@ -1,5 +1,3 @@
-# train.py (Final Fixed Version)
-
 import os
 import random
 import numpy as np
@@ -45,7 +43,6 @@ def load_all_data():
     for sym in SYMBOLS:
         path = os.path.join(DATA_DIR, f"{sym}_processed.csv")
         df = pd.read_csv(path, parse_dates=["time"])
-        # Apply 10x multiplier to ATR and other volatility measures
         df["ATR_14"] = df["ATR_14"] * 10
         if "KC_upper" in df.columns:
             df["KC_upper"] = df["KC_upper"] * 10
@@ -53,15 +50,14 @@ def load_all_data():
         df["symbol"] = sym
         frames.append(df)
     all_df = pd.concat(frames, ignore_index=True)
-    all_df.sort_values(by=["time","symbol"], inplace=True)
+    all_df.sort_values(by=["time", "symbol"], inplace=True)
 
     print("[2/4] Merging news sentiment...")
     try:
         news = pd.read_csv(NEWS_CSV, parse_dates=["date"])
         if news["date"].dt.tz is None:
             news["date"] = news["date"].dt.tz_localize('UTC')
-        
-        # Forward-fill missing news days
+
         all_dates = pd.date_range(
             start=all_df["time"].min().floor("D"),
             end=all_df["time"].max().ceil("D"),
@@ -72,20 +68,19 @@ def load_all_data():
             names=["date", "symbol"]
         )
         news = (news.set_index(["date", "symbol"])
-               .reindex(full_index)
-               .groupby(level="symbol").ffill()
-               .reset_index())
+                .reindex(full_index)
+                .groupby(level="symbol").ffill()
+                .reset_index())
     except Exception as e:
         print(f"[WARNING] News loading failed: {str(e)}")
         news = pd.DataFrame(columns=["date", "symbol", "news_count", "avg_sentiment"])
-    
-    # FIXED TIMEZONE HANDLING
+
     if all_df["time"].dt.tz is None:
         all_df["date"] = all_df["time"].dt.tz_localize('UTC').dt.floor("D")
     else:
         all_df["date"] = all_df["time"].dt.tz_convert('UTC').dt.floor("D")
 
-    all_df = all_df.merge(news, how="left", on=["date","symbol"])
+    all_df = all_df.merge(news, how="left", on=["date", "symbol"])
     all_df["news_count"] = all_df["news_count"].fillna(0)
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
     return all_df
@@ -100,26 +95,29 @@ class ForexMultiEnv(gym.Env):
         self.symbols = SYMBOLS
         self.n_rows = len(self.all_data)
         self.symbol_to_id = {sym: i for i, sym in enumerate(SYMBOLS)}
-        feature_cols = [c for c in self.all_data.columns if c not in ["time","symbol","date"]]
+        feature_cols = [c for c in self.all_data.columns if c not in ["time", "symbol", "date"]]
         self.feature_count = len(feature_cols)
-        
+
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(self.feature_count + len(SYMBOLS),),
             dtype=np.float32
         )
-        
+
         self.action_space = spaces.Box(
-            low=np.array([0.0, 1.0, 1.0, -0.1, 0.0]), # sl_mult now 1.0-10.0 (10x ATR)
+            low=np.array([0.0, 1.0, 1.0, -0.1, 0.0]),
             high=np.array([1.0, 10.0, 10.0, 0.1, 1.0]),
             dtype=np.float32
         )
-        
+
         self.initial_balance = initial_balance
-        self.reset()
+
+        # FIXED: scaler initialized before reset
         self.features = self.all_data[feature_cols].values
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
+
+        self.reset()
 
     def reset(self):
         self.balance = self.initial_balance
@@ -135,35 +133,30 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
-        
-        # Skip invalid price data
+
         if row["high"] <= row["low"]:
             self.current_step += 1
             return self._get_observation(self.current_step), 0, False, {}
-        
-        # Process action
+
         signal, sl_mult, tp_mult, sent_exit_thresh, confidence = np.clip(
             action, self.action_space.low, self.action_space.high
         )
-        
-        # Force first trade
+
         self.force_trade_counter += 1
         if self.total_trades == 0 and self.force_trade_counter >= 3000:
             confidence = max(confidence, 0.5)
             print(f"\n!!! FORCING FIRST TRADE AT STEP {self.current_step} !!!")
-        
-        # TRADE ENTRY
+
         if (confidence >= FIXED_CONFIDENCE_THRESHOLD and
             len(self.open_positions) < MAX_OPEN_TRADES and
             symbol not in self.open_positions):
-            
-            # Use raw ATR (already 10x scaled in load_all_data())
+
             atr = row["ATR_14"]
-            pip_value = 0.01 if "JPY" in symbol or symbol=="XAUUSD" else 0.0001
+            pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
             risk_amount = (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance
             lot_size = max(risk_amount / (atr * sl_mult / pip_value), 0.01)
             direction = 1 if signal >= 0.5 else -1
-            
+
             self.open_positions[symbol] = {
                 "direction": direction,
                 "entry_price": row["open"],
@@ -178,14 +171,12 @@ class ForexMultiEnv(gym.Env):
             print(f"\n[TRADE] {'LONG' if direction==1 else 'SHORT'} {symbol} "
                   f"@{row['open']:.5f} (Size: {lot_size:.2f} lots, "
                   f"ATR: {atr:.5f}, SL: {atr*sl_mult:.5f})")
-        
-        # TRADE EXIT
+
         reward = 0
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
-            
-            # Check exit conditions
+
             if ((pos["direction"] == 1 and row["low"] <= pos["sl_price"]) or
                 (pos["direction"] == -1 and row["high"] >= pos["sl_price"])):
                 exit_price = pos["sl_price"]
@@ -198,32 +189,30 @@ class ForexMultiEnv(gym.Env):
                   (pos["direction"] == -1 and row["avg_sentiment"] >= pos["sent_exit_thresh"])):
                 exit_price = row["close"]
                 exit_reason = "SENT"
-            
+
             if exit_price:
-                pip_value = 0.01 if "JPY" in symbol or symbol=="XAUUSD" else 0.0001
+                pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
                 pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
                 self.balance += pnl
                 reward = pnl
                 del self.open_positions[symbol]
                 print(f"[EXIT] {symbol} @ {exit_price:.5f} ({exit_reason}) "
                       f"| PnL: ${pnl:+.2f}")
-        
-        # Advance to next step
+
         self.current_step += 1
         done = self.current_step >= self.n_rows
         next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
-        
-        # Progress report
+
         if self.current_step % 5000 == 0:
             print(f"\n[Progress] Step: {self.current_step}/{self.n_rows} | "
                   f"Balance: ${self.balance:,.2f} | "
                   f"Trades: {self.total_trades}")
-        
+
         return next_obs, reward, done, {"balance": self.balance}
 
     def _get_observation(self, step):
         row = self.all_data.iloc[step]
-        features = self.scaler.transform([row.drop(["time","symbol","date"]).values])[0]
+        features = self.scaler.transform([row.drop(["time", "symbol", "date"]).values])[0]
         symbol_onehot = np.zeros(len(SYMBOLS))
         symbol_onehot[self.symbol_to_id[row["symbol"]]] = 1
         return np.concatenate([features, symbol_onehot])
@@ -257,16 +246,15 @@ def build_critic(input_shape, action_space):
 def train_agent():
     env = ForexMultiEnv(ALL_DATA)
     nb_actions = env.action_space.shape[0]
-    
-    # Build models
+
     actor = build_actor((1,) + env.observation_space.shape, env.action_space)
     critic = build_critic((1,) + env.observation_space.shape, env.action_space)
-    
-    # Configure agent
+
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
     random_process = OrnsteinUhlenbeckProcess(
         size=nb_actions, theta=0.3, mu=0.0, sigma=0.4, sigma_min=0.1
     )
+
     agent = DDPGAgent(
         nb_actions=nb_actions,
         actor=actor,
@@ -280,12 +268,10 @@ def train_agent():
         batch_size=BATCH_SIZE
     )
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
-    
-    # Train
+
     print("\nStarting training...")
     agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=1)
-    
-    # Save models
+
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
 
