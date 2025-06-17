@@ -279,19 +279,17 @@ class ForexMultiEnv(gym.Env):
         
         next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
         
+        # aggregated summary every 30 seconds
         if time.time() - self.last_summary_time >= 30:
-            print(f"\n[SUMMARY] Episode {self.current_episode} | Step {self.current_step}/{self.n_rows} | Balance: ${self.balance:,.2f} | Drawdown: {self.max_drawdown:.2%} | Total Trades: {self.total_trades}")
-            
-            if self.recent_trades:
-                print(" Recent Entries:")
-                for t in self.recent_trades:
-                    print(f" • {t['direction']} {t['symbol']} @ {t['entry_price']:.5f} | Size: {t['lot_size']:.2f} | ATR: {t['ATR']:.5f} | SL: {t['sl_price']:.5f} | TP: {t['tp_price']:.5f} | Conf: {t['confidence']:.4f}")
-            
-            if self.recent_exits:
-                print(" Recent Exits:")
-                for e in self.recent_exits:
-                    print(f" • {e['symbol']} exited @ {e['exit_price']:.5f} ({e['reason']}) | PnL: ${e['pnl']:+.2f} | Conf: {e['confidence']:.4f}")
-            
+            entry_count = len(self.recent_trades)
+            exit_count = len(self.recent_exits)
+            avg_entry_conf = np.mean([t["confidence"] for t in self.recent_trades]) if entry_count > 0 else 0.0
+            avg_exit_conf = np.mean([e["confidence"] for e in self.recent_exits]) if exit_count > 0 else 0.0
+            total_exit_pnl = sum(e["pnl"] for e in self.recent_exits)
+            print(f"\n[SUMMARY] Episode {self.current_episode} | Step {self.current_step}/{self.n_rows} "
+                  f"| Balance: ${self.balance:,.2f} | Drawdown: {self.max_drawdown:.2%} | Total Trades: {self.total_trades}")
+            print(f" Entries placed: {entry_count} | Avg Entry Conf: {avg_entry_conf:.4f}")
+            print(f" Exits executed: {exit_count} | Exit PnL: ${total_exit_pnl:+.2f} | Avg Exit Conf: {avg_exit_conf:.4f}")
             self.recent_trades.clear()
             self.recent_exits.clear()
             self.last_summary_time = time.time()
@@ -387,7 +385,7 @@ def train_agent():
     
     print("\nStarting training...")
     callbacks = [CheckpointSaver(save_path=CHECKPOINT_DIR, interval=50000)]
-    agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=1, callbacks=callbacks)
+    agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=0, callbacks=callbacks)
     
     # ========== EVALUATION ==========
     print("\n=== EVALUATING LEARNED POLICY ===")
