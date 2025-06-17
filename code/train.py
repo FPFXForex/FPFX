@@ -34,7 +34,7 @@ MAX_OPEN_TRADES = 3
 DAILY_DD_LIMIT = 1.0
 MIN_RISK = 0.01
 MAX_RISK = 0.02
-FIXED_CONFIDENCE_THRESHOLD = 0.001
+FIXED_CONFIDENCE_THRESHOLD = 0.0  # exploration during training
 
 # ========== DATA LOADING ==========
 def load_all_data():
@@ -117,9 +117,9 @@ class ForexMultiEnv(gym.Env):
         self.scaler = StandardScaler()
         self.scaler.fit(self.features)
 
-        # for controlling forced-first-trade
+        # first‐trade flag & periodic summary timer
         self.forced_first_trade = False
-        # for periodic summaries
+        self.first_real_trade_logged = False         # ← NEW FLAG
         self.last_summary_time = time.time()
 
         self.reset()
@@ -159,6 +159,11 @@ class ForexMultiEnv(gym.Env):
         if (confidence >= FIXED_CONFIDENCE_THRESHOLD and
             len(self.open_positions) < MAX_OPEN_TRADES and
             symbol not in self.open_positions):
+
+            # <<< LOG FIRST REAL TRADE >>>
+            if not self.forced_first_trade and self.total_trades == 0 and not self.first_real_trade_logged:
+                print(f"\n>>> FIRST GENUINE TRADE at step {self.current_step} | Confidence: {confidence:.4f}")
+                self.first_real_trade_logged = True
 
             atr = row["ATR_14"]
             pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
@@ -236,7 +241,6 @@ def build_actor(input_shape, action_space):
     x = Dense(256, activation="relu")(x)
     x = Dense(128, activation="relu")(x)
     raw_actions = Dense(action_space.shape[0], activation="sigmoid", name="raw_actions")(x)
-    # capture only NumPy arrays in closure for JSON serialization
     diff = action_space.high - action_space.low
     low  = action_space.low
     actions = Lambda(lambda x, d=diff, l=low: x * d + l, name="actions")(raw_actions)
@@ -272,8 +276,8 @@ def train_agent():
         critic=critic,
         critic_action_input=critic.input[1],
         memory=memory,
-        nb_steps_warmup_actor=10000,
-        nb_steps_warmup_critic=10000,
+        nb_steps_warmup_actor=0,
+        nb_steps_warmup_critic=0,
         random_process=random_process,
         gamma=DISCOUNT_FACTOR,
         target_model_update=1e-3,
@@ -283,6 +287,15 @@ def train_agent():
 
     print("\nStarting training...")
     agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=1)
+
+    # ========== EVALUATION ==========
+    print("\n=== EVALUATING LEARNED POLICY ===")
+    global FIXED_CONFIDENCE_THRESHOLD
+    FIXED_CONFIDENCE_THRESHOLD = 0.5  # only trades with confidence ≥ 0.5 now
+
+    eval_env = ForexMultiEnv(ALL_DATA)
+    eval_env.reset()
+    agent.test(eval_env, nb_episodes=1, visualize=False)
 
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
