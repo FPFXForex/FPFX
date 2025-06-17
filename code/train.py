@@ -1,4 +1,4 @@
-# train.py (Final Fixed Version with Adaptive Confidence Threshold)
+# train.py (Final Fixed Version)
 
 import os
 import random
@@ -36,12 +36,7 @@ MAX_OPEN_TRADES = 3
 DAILY_DD_LIMIT = 1.0
 MIN_RISK = 0.01
 MAX_RISK = 0.02
-
-# Adaptive Confidence Threshold Parameters
-INITIAL_CONFIDENCE_THRESHOLD = 0.001
-FINAL_CONFIDENCE_THRESHOLD = 0.25
-THRESHOLD_RAMP_STEPS = 150000
-MIN_TRADES_BEFORE_INCREASE = 50
+FIXED_CONFIDENCE_THRESHOLD = 0.001
 
 # ========== DATA LOADING ==========
 def load_all_data():
@@ -63,7 +58,9 @@ def load_all_data():
     print("[2/4] Merging news sentiment...")
     try:
         news = pd.read_csv(NEWS_CSV, parse_dates=["date"])
-        news["date"] = news["date"].dt.tz_localize('UTC')
+        if news["date"].dt.tz is None:
+            news["date"] = news["date"].dt.tz_localize('UTC')
+        
         # Forward-fill missing news days
         all_dates = pd.date_range(
             start=all_df["time"].min().floor("D"),
@@ -82,7 +79,12 @@ def load_all_data():
         print(f"[WARNING] News loading failed: {str(e)}")
         news = pd.DataFrame(columns=["date", "symbol", "news_count", "avg_sentiment"])
     
-    all_df["date"] = all_df["time"].dt.tz_localize('UTC').dt.floor("D")
+    # FIXED TIMEZONE HANDLING
+    if all_df["time"].dt.tz is None:
+        all_df["date"] = all_df["time"].dt.tz_localize('UTC').dt.floor("D")
+    else:
+        all_df["date"] = all_df["time"].dt.tz_convert('UTC').dt.floor("D")
+
     all_df = all_df.merge(news, how="left", on=["date","symbol"])
     all_df["news_count"] = all_df["news_count"].fillna(0)
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
@@ -114,10 +116,6 @@ class ForexMultiEnv(gym.Env):
         )
         
         self.initial_balance = initial_balance
-        self.confidence_threshold = INITIAL_CONFIDENCE_THRESHOLD
-        self.base_growth_rate = (FINAL_CONFIDENCE_THRESHOLD/INITIAL_CONFIDENCE_THRESHOLD) ** (1/THRESHOLD_RAMP_STEPS)
-        self.successful_trades = 0
-        self.total_trades_attempted = 0
         self.reset()
         self.features = self.all_data[feature_cols].values
         self.scaler = StandardScaler()
@@ -154,24 +152,10 @@ class ForexMultiEnv(gym.Env):
             confidence = max(confidence, 0.5)
             print(f"\n!!! FORCING FIRST TRADE AT STEP {self.current_step} !!!")
         
-        # Update confidence threshold (adaptive exponential increase)
-        if (self.total_trades_attempted > MIN_TRADES_BEFORE_INCREASE and 
-            self.confidence_threshold < FINAL_CONFIDENCE_THRESHOLD):
-            success_ratio = self.successful_trades / max(1, self.total_trades_attempted)
-            performance_factor = 0.8 + (success_ratio * 0.4)  # Between 0.8-1.2
-            effective_growth = self.base_growth_rate ** performance_factor
-            self.confidence_threshold = min(
-                FINAL_CONFIDENCE_THRESHOLD,
-                self.confidence_threshold * effective_growth
-            )
-        
         # TRADE ENTRY
-        if (confidence >= self.confidence_threshold and
+        if (confidence >= FIXED_CONFIDENCE_THRESHOLD and
             len(self.open_positions) < MAX_OPEN_TRADES and
             symbol not in self.open_positions):
-            
-            # Count this trade attempt
-            self.total_trades_attempted += 1
             
             # Use raw ATR (already 10x scaled in load_all_data())
             atr = row["ATR_14"]
@@ -220,11 +204,6 @@ class ForexMultiEnv(gym.Env):
                 pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
                 self.balance += pnl
                 reward = pnl
-                
-                # Track successful trades
-                if pnl > 0:
-                    self.successful_trades += 1
-                
                 del self.open_positions[symbol]
                 print(f"[EXIT] {symbol} @ {exit_price:.5f} ({exit_reason}) "
                       f"| PnL: ${pnl:+.2f}")
@@ -234,13 +213,11 @@ class ForexMultiEnv(gym.Env):
         done = self.current_step >= self.n_rows
         next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
         
-        # Progress report (now includes threshold info)
+        # Progress report
         if self.current_step % 5000 == 0:
             print(f"\n[Progress] Step: {self.current_step}/{self.n_rows} | "
                   f"Balance: ${self.balance:,.2f} | "
-                  f"Trades: {self.total_trades} | "
-                  f"Threshold: {self.confidence_threshold:.4f} | "
-                  f"Success Rate: {self.successful_trades/max(1,self.total_trades_attempted):.1%}")
+                  f"Trades: {self.total_trades}")
         
         return next_obs, reward, done, {"balance": self.balance}
 
