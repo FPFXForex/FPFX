@@ -146,8 +146,8 @@ class ForexMultiEnv(gym.Env):
         self.features = self.all_data[feature_cols].values
         self.scaler = StandardScaler().fit(self.features)
         self.forced_first_trade = False
-        self.recent_trades = []
-        self.recent_exits = []
+        self.recent_trades = deque(maxlen=10)
+        self.recent_exits = deque(maxlen=10)
         self.last_summary_time = time.time()
         self.reset()
 
@@ -177,6 +177,25 @@ class ForexMultiEnv(gym.Env):
             return 10.0  # Gold: 1 pip = $10 per standard lot
         else:
             return 10.0  # Standard pairs: 1 pip = $10 per standard lot
+
+    def _print_recent_trades(self):
+        """Prints the recent trades and exits in a formatted way"""
+        if not self.recent_trades and not self.recent_exits:
+            return
+            
+        print("\n=== RECENT TRADES ===")
+        print("Recent Entries:")
+        for trade in reversed(self.recent_trades):
+            print(f"{trade['symbol']} | {'BUY' if trade['direction'] == 1 else 'SELL'} | "
+                  f"Entry: {trade['entry_price']:.5f} | Lot: {trade['lot_size']:.2f} | "
+                  f"Conf: {trade['confidence']:.2f} | SL: {trade['sl_price']:.5f} | "
+                  f"TP: {trade['tp_price']:.5f} | RR: {trade['rr_ratio']:.2f}:1")
+        
+        print("\nRecent Exits:")
+        for exit in reversed(self.recent_exits):
+            print(f"{exit['symbol']} | Exit: {exit['exit_price']:.5f} | "
+                  f"P/L: ${exit['pnl']:+.2f} | Lot: {exit['lot_size']:.2f} | "
+                  f"Conf: {exit['confidence']:.2f} | Reason: {exit['reason']}")
 
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
@@ -263,11 +282,12 @@ class ForexMultiEnv(gym.Env):
                 self.total_trades += 1
                 self.recent_trades.append({**entry, "symbol": symbol})
 
-        # TRADE EXIT (FULLY WRITTEN OUT - NO PLACEHOLDERS)
+        # TRADE EXIT
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
             pip_value = self._get_pip_value(symbol, pos["entry_price"])
+            atr_pips = row["ATR_14"] / pip_value_unit if 'pip_value_unit' in locals() else row["ATR_14"] / self._get_pip_value(symbol, 1.0)
 
             # Check exit conditions
             if ((pos["direction"] == 1 and row["low"] <= pos["sl_price"]) or
@@ -329,6 +349,7 @@ class ForexMultiEnv(gym.Env):
         if time.time() - self.last_summary_time >= 120:
             self.last_summary_time = time.time()
             print(f"\n[SUMMARY] Ep {self.current_episode} | Step {self.current_step}/{self.n_rows} | Bal ${self.balance:,.2f} | DD {self.max_drawdown:.2%} | Trades {self.total_trades}")
+            self._print_recent_trades()
 
         return self._get_observation(self.current_step), reward, done, {
             "balance": self.balance,
@@ -380,7 +401,9 @@ def train_agent():
         "total_episodes": env.current_episode,
         "final_balance": env.balance,
         "total_trades": env.total_trades,
-        "max_drawdown": env.max_drawdown
+        "max_drawdown": env.max_drawdown,
+        "recent_trades": list(env.recent_trades),
+        "recent_exits": list(env.recent_exits)
     }
     joblib.dump(stats, os.path.join(MODEL_DIR, "training_stats.pkl"))
     print("[SAVED] All models and stats saved to disk")
