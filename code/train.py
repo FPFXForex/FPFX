@@ -17,7 +17,6 @@ from tensorflow.keras.optimizers import Adam
 import time
 from rl.callbacks import Callback
 from collections import deque
-from pprint import pformat
 
 # ========== CONFIGURATION ==========
 SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
@@ -29,7 +28,7 @@ CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Hyperparameters (UNCHANGED)
+# Hyperparameters
 INITIAL_BALANCE = 100000.0
 DISCOUNT_FACTOR = 0.99
 TRAIN_STEPS = 700000
@@ -81,10 +80,10 @@ def load_all_data():
         try:
             df = pd.read_csv(path, parse_dates=["time"])
             if sym != "XAUUSD":
-                df["ATR_14"] = df["ATR_14"] * 10  # KEEP YOUR 10x SCALING
+                df["ATR_14"] = df["ATR_14"] * 10000  # Convert to pips (0.0001 -> 1 pip)
             if "KC_upper" in df.columns:
-                df["KC_upper"] = df["KC_upper"] * 10
-                df["KC_lower"] = df["KC_lower"] * 10
+                df["KC_upper"] = df["KC_upper"] * 10000
+                df["KC_lower"] = df["KC_lower"] * 10000
             df["symbol"] = sym
             frames.append(df)
         except Exception as e:
@@ -204,31 +203,31 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
-        atr = row["ATR_14"]  # Already scaled by 10x in load_all_data()
+        atr_pips = row["ATR_14"]  # Now in pips (already scaled in load_all_data)
         
         if row["high"] <= row["low"]:
             self.current_step += 1
             return self._get_observation(self.current_step), 0, False, {"balance": self.balance}
         
-        # Clip SL/TP multipliers to realistic ranges
+        # Clip SL/TP multipliers
         signal, sl_mult, tp_mult, sent_exit_thresh, confidence = np.clip(
             action,
             [0.0, MIN_SL_MULT, MIN_TP_MULT, -0.1, 0.0],
             [1.0, MAX_SL_MULT, MAX_TP_MULT, 0.1, 1.0]
         )
         
-        # update drawdown
+        # Update drawdown
         self.balance = max(0, self.balance)
         self.max_balance = max(self.max_balance, self.balance)
         self.max_drawdown = max(self.max_drawdown,
                               (self.max_balance - self.balance) / self.max_balance)
         
-        # early reset
+        # Early reset conditions
         if self.balance < 1000 or self.max_drawdown >= DAILY_DD_LIMIT:
             print(f"\n[EARLY RESET] Ep {self.current_episode} | Bal ${self.balance:.2f} | DD {self.max_drawdown:.2%}")
             return self.reset(), 0, True, {"balance": self.balance}
         
-        # forced first trade
+        # Forced first trade
         self.force_trade_counter += 1
         if not self.forced_first_trade and self.total_trades == 0 and self.force_trade_counter >= 3000:
             confidence = max(confidence, 0.5)
@@ -238,36 +237,40 @@ class ForexMultiEnv(gym.Env):
         
         # TRADE ENTRY
         if confidence >= FIXED_CONFIDENCE_THRESHOLD and len(self.open_positions) < MAX_OPEN_TRADES and symbol not in self.open_positions:
-            pip_value = 0.0001  # Default for most pairs
-            if "JPY" in symbol or symbol == "XAUUSD":
-                pip_value = 0.01
-            
             # Calculate risk amount (0.5% to 2% of balance)
             risk_amt = max(MIN_RISK * self.balance,
-                          (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
+                         (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
             
-            # CORRECTED LOT SIZE CALCULATION
-            stop_distance_price = atr * sl_mult  # Stop distance in price units
-            risk_per_lot = stop_distance_price / pip_value  # Risk per 1 lot
-            lot = risk_amt / risk_per_lot  # Proper lot size
+            # Calculate stop distance in pips
+            stop_distance_pips = atr_pips * sl_mult
+            
+            # Calculate proper lot size
+            if "JPY" in symbol or symbol == "XAUUSD":
+                lot = (risk_amt / stop_distance_pips) * 100  # For JPY and Gold (1 pip = 0.01)
+            else:
+                lot = risk_amt / stop_distance_pips  # For other pairs (1 pip = 0.0001)
+            
             lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
             
             # Calculate risk-reward ratio
             direction = 1 if signal >= 0.5 else -1
-            risk_dist = abs(row["open"] - (row["open"] - direction * atr * sl_mult))
-            reward_dist = abs((row["open"] + direction * atr * tp_mult) - row["open"])
-            rr_ratio = reward_dist / risk_dist
+            entry_price = row["open"]
+            sl_price = entry_price - direction * (stop_distance_pips * (0.0001 if "JPY" not in symbol and symbol != "XAUUSD" else 0.01))
+            tp_price = entry_price + direction * (atr_pips * tp_mult * (0.0001 if "JPY" not in symbol and symbol != "XAUUSD" else 0.01))
             
-            # Enforce minimum RR ratio of 1:1
+            risk_dist = abs(entry_price - sl_price)
+            reward_dist = abs(tp_price - entry_price)
+            rr_ratio = reward_dist / risk_dist if risk_dist > 0 else 1.0
+            
             if rr_ratio < 1.0:
-                reward -= 10.0  # Heavy penalty for poor RR
+                reward -= 10.0  # Penalty for poor RR
                 
             if lot >= MIN_LOT_SIZE:
                 entry = {
                     "direction": direction,
-                    "entry_price": row["open"],
-                    "sl_price": row["open"] - direction * atr * sl_mult,
-                    "tp_price": row["open"] + direction * atr * tp_mult,
+                    "entry_price": entry_price,
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
                     "lot_size": lot,
                     "sent_exit_thresh": sent_exit_thresh,
                     "confidence": confidence,
@@ -279,52 +282,42 @@ class ForexMultiEnv(gym.Env):
                 self.total_trades += 1
                 self.recent_trades.append({**entry, "symbol": symbol})
         
-        # TRADE EXIT (UNCHANGED)
+        # TRADE EXIT
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
             pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
             
-            # Apply slippage to SL exits
+            # Check exit conditions
             if ((pos["direction"] == 1 and row["low"] <= pos["sl_price"]) or
                 (pos["direction"] == -1 and row["high"] >= pos["sl_price"])):
                 exit_price = pos["sl_price"]
                 exit_reason = "SL"
-                slippage = SLIPPAGE_RATIO * atr
+                slippage = SLIPPAGE_RATIO * (atr_pips * (0.0001 if "JPY" not in symbol and symbol != "XAUUSD" else 0.01))
                 exit_price += -pos["direction"] * slippage
-                
-                pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
-                commission = COMMISSION_PIPS * pos["lot_size"]
-                pnl -= commission
-                reward = pnl * 2  # punish SL twice as heavy
                 
             elif ((pos["direction"] == 1 and row["high"] >= pos["tp_price"]) or
                   (pos["direction"] == -1 and row["low"] <= pos["tp_price"])):
                 exit_price = pos["tp_price"]
                 exit_reason = "TP"
-                pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
-                commission = COMMISSION_PIPS * pos["lot_size"]
-                pnl -= commission
-                reward = pnl  # reward equals actual profit
                 
             elif ((pos["direction"] == 1 and row["avg_sentiment"] <= pos["sent_exit_thresh"]) or
                   (pos["direction"] == -1 and row["avg_sentiment"] >= pos["sent_exit_thresh"])):
                 exit_price = row["close"]
                 exit_reason = "SENT"
+                
+            if exit_price is not None:
                 pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
                 commission = COMMISSION_PIPS * pos["lot_size"]
                 pnl -= commission
-                reward = pnl  # neutral / break-even
-                
-            if exit_price is not None:
                 self.balance += pnl
-                time_held = self.current_step - pos["entry_step"]
-                reward = reward * pos["rr_ratio"]  # Scale by risk-reward ratio
-                reward -= time_held * TIME_PENALTY_FACTOR  # Time penalty
                 
-                # Confidence-based penalty for losses
+                # Calculate reward
+                reward = pnl * pos["rr_ratio"]  # Scale by risk-reward ratio
+                reward -= (self.current_step - pos["entry_step"]) * TIME_PENALTY_FACTOR
+                
                 if pnl < 0:
-                    reward *= (1 + pos["confidence"])  # Increase penalty for high-confidence losses
+                    reward *= (1 + pos["confidence"])  # Penalty for high-confidence losses
                     
                 self.recent_exits.append({
                     "symbol": symbol,
@@ -341,8 +334,6 @@ class ForexMultiEnv(gym.Env):
         
         self.current_step += 1
         done = self.current_step >= self.n_rows
-        
-        next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
         
         # Sharpe-like reward normalization
         self.recent_rewards.append(reward)
@@ -388,7 +379,10 @@ class ForexMultiEnv(gym.Env):
                           f"Lot: {trade['lot_size']:.2f} | "
                           f"Confidence: {trade['confidence']:.2f}")
         
-        return next_obs, reward, done, {"balance": self.balance, "max_drawdown": self.max_drawdown}
+        return self._get_observation(self.current_step), reward, done, {
+            "balance": self.balance,
+            "max_drawdown": self.max_drawdown
+        }
 
     def _get_observation(self, step):
         row = self.all_data.iloc[step]
