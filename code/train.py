@@ -17,6 +17,7 @@ from tensorflow.keras.optimizers import Adam
 import time
 from rl.callbacks import Callback
 from collections import deque
+from pprint import pformat
 
 # ========== CONFIGURATION ==========
 SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
@@ -52,7 +53,7 @@ SHARPE_EPSILON = 1e-5  # small value to avoid division by zero
 
 # ========== ENHANCEMENTS ==========
 MIN_SL_MULT = 1.0  # Minimum SL multiplier (1x ATR)
-MAX_SL_MULT = 5.0  # Maximum SL multiplier (5x ATR)
+MAX_SL_MULT = 3.0  # Maximum SL multiplier (3x ATR)
 MIN_TP_MULT = 1.0  # Minimum TP multiplier (1x ATR)
 MAX_TP_MULT = 5.0  # Maximum TP multiplier (5x ATR)
 SLIPPAGE_RATIO = 0.3  # Slippage as % of ATR
@@ -208,7 +209,7 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
-        atr = row["ATR_14"]  # Moved this line up to make atr available for all cases
+        atr = row["ATR_14"]
         
         if row["high"] <= row["low"]:
             self.current_step += 1
@@ -353,10 +354,40 @@ class ForexMultiEnv(gym.Env):
                 std_r = SHARPE_EPSILON
             reward = (reward - mean_r) / std_r
         
-        # Print summary every 2 minutes
+        # Print comprehensive summary every 2 minutes
         if time.time() - self.last_summary_time >= 120:
+            self.last_summary_time = time.time()
             print(f"\n[SUMMARY] Ep {self.current_episode} | Step {self.current_step}/{self.n_rows} | Bal ${self.balance:,.2f} | DD {self.max_drawdown:.2%} | Trades {self.total_trades}")
-            # ... (rest of your summary logging remains unchanged)
+            
+            if self.open_positions:
+                print("\n=== OPEN TRADES ===")
+                for sym, trade in self.open_positions.items():
+                    print(f"{sym}: Direction {'LONG' if trade['direction'] == 1 else 'SHORT'} | "
+                          f"Entry: {trade['entry_price']:.5f} | "
+                          f"SL: {trade['sl_price']:.5f} | "
+                          f"TP: {trade['tp_price']:.5f} | "
+                          f"Lot: {trade['lot_size']:.2f} | "
+                          f"Confidence: {trade['confidence']:.2f}")
+            
+            if self.recent_trades:
+                print("\n=== RECENT ENTRIES ===")
+                for trade in self.recent_trades[-5:]:  # Show last 5 entries
+                    print(f"{trade['symbol']}: {'LONG' if trade['direction'] == 1 else 'SHORT'} | "
+                          f"Entry: {trade['entry_price']:.5f} | "
+                          f"SL: {trade['sl_price']:.5f} | "
+                          f"TP: {trade['tp_price']:.5f} | "
+                          f"Lot: {trade['lot_size']:.2f} | "
+                          f"Confidence: {trade['confidence']:.2f}")
+            
+            if self.recent_exits:
+                print("\n=== RECENT EXITS ===")
+                for trade in self.recent_exits[-5:]:  # Show last 5 exits
+                    print(f"{trade['symbol']}: Exit {trade['reason']} | "
+                          f"Entry: {trade['entry_price']:.5f} | "
+                          f"Exit: {trade['exit_price']:.5f} | "
+                          f"PNL: ${trade['pnl']:,.2f} | "
+                          f"Lot: {trade['lot_size']:.2f} | "
+                          f"Confidence: {trade['confidence']:.2f}")
         
         return next_obs, reward, done, {"balance": self.balance, "max_drawdown": self.max_drawdown}
 
