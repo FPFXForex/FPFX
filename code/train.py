@@ -41,6 +41,7 @@ MAX_RISK = 0.02   # 2% per trade
 FIXED_CONFIDENCE_THRESHOLD = 0.0  # exploration during training
 MIN_LOT_SIZE = 0.1
 MAX_LOT_SIZE = 20.0  # Increased maximum lot size to 20
+COMMISSION_PIPS = 0.02  # 0.02 pips per trade commission
 
 # ========== DATA LOADING ==========
 def load_all_data():
@@ -134,10 +135,11 @@ class ForexMultiEnv(gym.Env):
             dtype=np.float32
         )
         self.action_space = spaces.Box(
-            low=np.array([0.0,1.0,1.0,-0.1,0.0],dtype=np.float32),
-            high=np.array([1.0,10.0,10.0,0.1,1.0],dtype=np.float32),
+            low=np.array([0.0, 1.0, 1.0, -0.1, 0.0], dtype=np.float32),
+            high=np.array([1.0, 10.0, 10.0, 0.1, 1.0], dtype=np.float32),
             dtype=np.float32
         )
+
         self.initial_balance = initial_balance
         self.current_episode = 0
         self.features = self.all_data[feature_cols].values
@@ -153,6 +155,7 @@ class ForexMultiEnv(gym.Env):
         self.max_balance = self.initial_balance
         self.max_drawdown = 0.0
         self.open_positions = {}
+        self.last_entry_step = {sym: -OVERTRADE_BARS - 1 for sym in self.symbols}
         self.current_step = 0
         self.episode_trades = 0
         self.total_trades = 0
@@ -168,89 +171,118 @@ class ForexMultiEnv(gym.Env):
         symbol = row["symbol"]
         if row["high"] <= row["low"]:
             self.current_step += 1
-            return self._get_observation(self.current_step), 0, False, {}
+            return self._get_observation(self.current_step), 0, False, {"balance": self.balance}
 
-        signal, sl_mult, tp_mult, sent_exit, conf = np.clip(
+        signal, sl_mult, tp_mult, sent_exit_thresh, confidence = np.clip(
             action, self.action_space.low, self.action_space.high
         )
+        # update drawdown
         self.balance = max(0, self.balance)
         self.max_balance = max(self.max_balance, self.balance)
         self.max_drawdown = max(self.max_drawdown,
                                 (self.max_balance - self.balance) / self.max_balance)
-        if self.balance < 1000 or self.max_drawdown >= DAILY_DD_LIMIT:
-            print(f"\n[EARLY RESET] Episode {self.current_episode} | Balance: ${self.balance:.2f} | Drawdown: {self.max_drawdown:.2%}")
-            return self.reset(), 0, True, {}
 
+        # early reset
+        if self.balance < 1000 or self.max_drawdown >= DAILY_DD_LIMIT:
+            print(f"\n[EARLY RESET] Ep {self.current_episode} | Bal ${self.balance:.2f} | DD {self.max_drawdown:.2%}")
+            return self.reset(), 0, True, {"balance": self.balance}
+
+        # forced first trade
         self.force_trade_counter += 1
         if not self.forced_first_trade and self.total_trades == 0 and self.force_trade_counter >= 3000:
-            conf = max(conf, 0.5)
+            confidence = max(confidence, 0.5)
             self.forced_first_trade = True
 
         reward = 0
+
         # TRADE ENTRY
-        if (conf >= FIXED_CONFIDENCE_THRESHOLD and
-            len(self.open_positions) < MAX_OPEN_TRADES and
-            symbol not in self.open_positions):
+        if confidence >= FIXED_CONFIDENCE_THRESHOLD and len(self.open_positions) < MAX_OPEN_TRADES and symbol not in self.open_positions:
             atr = row["ATR_14"]
-            pv = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
+            pip_val = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
             risk_amt = max(MIN_RISK * self.balance,
-                           (MIN_RISK + conf * (MAX_RISK - MIN_RISK)) * self.balance)
-            lot = max(min(risk_amt / (atr * sl_mult / pv), MAX_LOT_SIZE), MIN_LOT_SIZE)
+                           (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
+            lot = max(min(risk_amt / (atr * sl_mult / pip_val), MAX_LOT_SIZE), MIN_LOT_SIZE)
             if lot >= MIN_LOT_SIZE:
                 direction = 1 if signal >= 0.5 else -1
-                self.open_positions[symbol] = {
+                entry = {
                     "direction": direction,
                     "entry_price": row["open"],
-                    "sl": row["open"] - direction * atr * sl_mult,
-                    "tp": row["open"] + direction * atr * tp_mult,
-                    "lot": lot,
-                    "conf": conf
+                    "sl_price": row["open"] - direction * atr * sl_mult,
+                    "tp_price": row["open"] + direction * atr * tp_mult,
+                    "lot_size": lot,
+                    "sent_exit_thresh": sent_exit_thresh,
+                    "confidence": confidence
                 }
+                self.open_positions[symbol] = entry
                 self.episode_trades += 1
                 self.total_trades += 1
-                self.recent_trades.append({"confidence": conf})
+                self.recent_trades.append({**entry, "symbol": symbol})
 
         # TRADE EXIT
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
-            exit_price, reason = None, None
-            if (pos["direction"] == 1 and row["low"] <= pos["sl"]) or \
-               (pos["direction"] == -1 and row["high"] >= pos["sl"]):
-                exit_price, reason, reward = pos["sl"], "SL", -abs(pos["lot"] * 2)
-            elif (pos["direction"] == 1 and row["high"] >= pos["tp"]) or \
-                 (pos["direction"] == -1 and row["low"] <= pos["tp"]):
-                exit_price, reason, reward = pos["tp"], "TP", pos["lot"]
-            elif (pos["direction"] == 1 and row["avg_sentiment"] <= sent_exit) or \
-                 (pos["direction"] == -1 and row["avg_sentiment"] >= sent_exit):
-                exit_price, reason, reward = row["close"], "SENT", 0
+            exit_price = None
+            exit_reason = None
+            # SL
+            if (pos["direction"] == 1 and row["low"] <= pos["sl_price"]) or \
+               (pos["direction"] == -1 and row["high"] >= pos["sl_price"]):
+                exit_price, exit_reason = pos["sl_price"], "SL"
+            # TP
+            elif (pos["direction"] == 1 and row["high"] >= pos["tp_price"]) or \
+                 (pos["direction"] == -1 and row["low"] <= pos["tp_price"]):
+                exit_price, exit_reason = pos["tp_price"], "TP"
+            # Sentiment
+            elif (pos["direction"] == 1 and row["avg_sentiment"] <= pos["sent_exit_thresh"]) or \
+                 (pos["direction"] == -1 and row["avg_sentiment"] >= pos["sent_exit_thresh"]):
+                exit_price, exit_reason = row["close"], "SENT"
+
             if exit_price is not None:
-                pv = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
-                pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot"] / pv)
+                pip_val = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
+                pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_val)
+                # subtract commission
+                commission = COMMISSION_PIPS * pos["lot_size"]
+                pnl -= commission
                 self.balance += pnl
-                self.recent_exits.append({"pnl": pnl, "confidence": pos["conf"]})
+                self.recent_exits.append({
+                    "symbol": symbol,
+                    "reason": exit_reason,
+                    "entry_price": pos["entry_price"],
+                    "sl_price": pos["sl_price"],
+                    "tp_price": pos["tp_price"],
+                    "lot_size": pos["lot_size"],
+                    "confidence": pos["confidence"],
+                    "exit_price": exit_price,
+                    "pnl": pnl
+                })
                 del self.open_positions[symbol]
 
         self.current_step += 1
         done = self.current_step >= self.n_rows
-        obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
+        next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
 
-        # === CHANGED: summary every 120 seconds ===
+        # aggregated summary every 2 minutes
         if time.time() - self.last_summary_time >= 120:
-            ecount = len(self.recent_trades)
-            xcount = len(self.recent_exits)
-            aec = (np.mean([t["confidence"] for t in self.recent_trades]) if ecount else 0.0)
-            axc = (np.mean([e["confidence"] for e in self.recent_exits]) if xcount else 0.0)
-            xpnl = sum(e["pnl"] for e in self.recent_exits)
-            print(f"\n[SUMMARY] Episode {self.current_episode} | Step {self.current_step}/{self.n_rows} "
-                  f"| Balance: ${self.balance:,.2f} | Drawdown: {self.max_drawdown:.2%} | Total Trades: {self.total_trades}")
-            print(f" Entries: {ecount} | Avg Entry Conf: {aec:.3f}")
-            print(f" Exits:   {xcount} | PnL: {xpnl:+.2f} | Avg Exit Conf: {axc:.3f}")
+            print(f"\n[SUMMARY] Ep {self.current_episode} | Step {self.current_step}/{self.n_rows} | Bal ${self.balance:,.2f} | DD {self.max_drawdown:.2%} | Trades {self.total_trades}")
+            # open positions
+            if self.open_positions:
+                print(" Open Positions:")
+                for sym, pos in self.open_positions.items():
+                    print(f"  • {sym} { 'LONG' if pos['direction']==1 else 'SHORT' } @ {pos['entry_price']:.5f} | SL {pos['sl_price']:.5f} | TP {pos['tp_price']:.5f} | Lot {pos['lot_size']:.2f} | Conf {pos['confidence']:.3f}")
+            # entries placed
+            print(f" Entries placed: {len(self.recent_trades)}")
+            for t in self.recent_trades:
+                print(f"  ↪ {t['symbol']} {'LONG' if t['direction']==1 else 'SHORT'} @ {t['entry_price']:.5f} | SL {t['sl_price']:.5f} | TP {t['tp_price']:.5f} | Lot {t['lot_size']:.2f} | Conf {t['confidence']:.3f}")
+            # exits executed
+            print(f" Exits executed: {len(self.recent_exits)}")
+            for e in self.recent_exits:
+                print(f"  ↩ {e['symbol']} exited @ {e['exit_price']:.5f} ({e['reason']}) | Entry {e['entry_price']:.5f} | SL {e['sl_price']:.5f} | TP {e['tp_price']:.5f} | Lot {e['lot_size']:.2f} | Conf {e['confidence']:.3f} | PnL {e['pnl']:+.2f}")
+            # heartbeat
             print(f"[HEARTBEAT] still running at {time.strftime('%H:%M:%S')}")
             self.recent_trades.clear()
             self.recent_exits.clear()
             self.last_summary_time = time.time()
 
-        return obs, reward, done, {"balance": self.balance, "max_drawdown": self.max_drawdown}
+        return next_obs, 0 if done else reward, done, {"balance": self.balance, "max_drawdown": self.max_drawdown}
 
     def _get_observation(self, step):
         row = self.all_data.iloc[step]
@@ -259,40 +291,23 @@ class ForexMultiEnv(gym.Env):
         oh[self.symbol_to_id[row["symbol"]]] = 1
         return np.concatenate([feats, oh])
 
-
 # ========== CHECKPOINT CALLBACK ==========
 class CheckpointSaver(Callback):
-    def __init__(self, save_path, interval=10000):
+    def __init__(self, save_path, interval=50000):
         super().__init__()
         self.save_path = save_path
         self.interval = interval
-        os.makedirs(save_path, exist_ok=True)
+        os.makedirs(self.save_path, exist_ok=True)
 
     def on_step_end(self, step, logs=None):
-        if step and step % self.interval == 0:
+        if step % self.interval == 0 and step > 0:
             fn = os.path.join(self.save_path, f"ddpg_weights_step_{step}.h5f")
             self.model.save_weights(fn, overwrite=True)
-            print(f"\n[SAVED] Weights checkpoint at step {step} ➔ {fn}")
-
-
-# ========== TRAINING MONITOR ==========
-class TrainingMonitor(Callback):
-    def __init__(self, log_interval=120):
-        super().__init__()
-        self.log_interval = log_interval
-        self.last = time.time()
-
-    def on_step_end(self, step, logs=None):
-        now = time.time()
-        if now - self.last >= self.log_interval:
-            print(f"[HEARTBEAT] DDPG training at step {step} — {time.strftime('%H:%M:%S')}")
-            self.last = now
-
+            print(f"\n[SAVED] Weights checkpoint at step {step} ➝ {fn}")
 
 def get_latest_checkpoint(path):
-    files = glob.glob(os.path.join(path, "ddpg_weights_step_*.h5f"))
-    return max(files, key=os.path.getmtime) if files else None
-
+    ckpts = glob.glob(os.path.join(path, "ddpg_weights_step_*.h5f"))
+    return max(ckpts, key=os.path.getmtime) if ckpts else None
 
 # ========== TRAINING ==========
 def train_agent():
@@ -303,9 +318,7 @@ def train_agent():
     critic = build_critic((1,) + env.observation_space.shape, env.action_space)
 
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
-    rnd = OrnsteinUhlenbeckProcess(
-        size=nb_actions, theta=0.15, mu=0.0, sigma=0.2, sigma_min=0.05
-    )
+    rnd = OrnsteinUhlenbeckProcess(size=nb_actions, theta=0.15, mu=0.0, sigma=0.2, sigma_min=0.05)
 
     agent = DDPGAgent(
         nb_actions=nb_actions,
@@ -322,29 +335,32 @@ def train_agent():
     )
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
 
-    # resume if possible
     latest = get_latest_checkpoint(CHECKPOINT_DIR)
     if latest:
-        print(f"[RESUME] loading {latest}")
+        print(f"[RESUMING] Loading weights from: {latest}")
         agent.load_weights(latest)
 
-    print("Starting training...")
-    callbacks = [
-        CheckpointSaver(CHECKPOINT_DIR, interval=10000),
-        TrainingMonitor(log_interval=120)
-    ]
+    print("\nStarting training...")
+    callbacks = [CheckpointSaver(CHECKPOINT_DIR, interval=50000)]
     agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=0, callbacks=callbacks)
 
-    # final saves
+    # ========== EVALUATION ==========
+    print("\n=== EVALUATING LEARNED POLICY ===")
+    global FIXED_CONFIDENCE_THRESHOLD
+    FIXED_CONFIDENCE_THRESHOLD = 0.5
+    eval_env = ForexMultiEnv(ALL_DATA)
+    eval_env.reset()
+    agent.test(eval_env, nb_episodes=5, visualize=False)
+
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
-    joblib.dump({
-        "episodes": env.current_episode,
-        "balance": env.balance,
-        "trades": env.total_trades,
-        "drawdown": env.max_drawdown
-    }, os.path.join(MODEL_DIR, "training_stats.pkl"))
-
+    stats = {
+        "total_episodes": eval_env.current_episode,
+        "final_balance": eval_env.balance,
+        "total_trades": eval_env.total_trades,
+        "max_drawdown": eval_env.max_drawdown
+    }
+    joblib.dump(stats, os.path.join(MODEL_DIR, "training_stats.pkl"))
 
 if __name__ == "__main__":
     train_agent()
