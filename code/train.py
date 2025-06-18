@@ -17,7 +17,7 @@ from collections import deque
 
 # ========== CONFIGURATION ==========
 SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed")
 NEWS_CSV = os.path.join(BASE_DIR, "Data", "news_cache.csv")
 MODEL_DIR = os.path.join(BASE_DIR, "model")
@@ -49,7 +49,6 @@ MAX_SL_MULT = 5.0
 MIN_TP_MULT = 1.0
 MAX_TP_MULT = 5.0
 SLIPPAGE_RATIO = 0.3
-ATR_SCALING_FACTOR = 10  # Scale ATR values to make them more usable
 
 # ========== DATA LOADING ==========
 def load_all_data():
@@ -59,20 +58,10 @@ def load_all_data():
         path = os.path.join(DATA_DIR, f"{sym}_processed.csv")
         try:
             df = pd.read_csv(path, parse_dates=["time"])
-            
-            # Scale ATR values to make them usable for stop distance calculation
-            df["ATR_14"] = df["ATR_14"] * ATR_SCALING_FACTOR
-            
-            # Scale KC bands similarly if they exist
-            if "KC_upper" in df.columns:
-                df["KC_upper"] = df["KC_upper"] * ATR_SCALING_FACTOR
-                df["KC_lower"] = df["KC_lower"] * ATR_SCALING_FACTOR
-            
             df["symbol"] = sym
             frames.append(df)
         except Exception as e:
             print(f"Error loading {sym}: {e}")
-    
     all_df = pd.concat(frames, ignore_index=True)
     all_df.sort_values(by=["time", "symbol"], inplace=True)
 
@@ -81,7 +70,6 @@ def load_all_data():
         news = pd.read_csv(NEWS_CSV, parse_dates=["date"])
         if news["date"].dt.tz is None:
             news["date"] = news["date"].dt.tz_localize('UTC')
-        
         all_dates = pd.date_range(
             start=all_df["time"].min().floor("D"),
             end=all_df["time"].max().ceil("D"),
@@ -100,13 +88,11 @@ def load_all_data():
         all_df["date"] = all_df["time"].dt.tz_localize('UTC').dt.floor("D")
     else:
         all_df["date"] = all_df["time"].dt.tz_convert('UTC').dt.floor("D")
-
     all_df = all_df.merge(news, how="left", on=["date", "symbol"])
     all_df["news_count"] = all_df["news_count"].fillna(0)
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
     all_df.fillna(method="ffill", inplace=True)
     all_df.fillna(0.0, inplace=True)
-    
     return all_df
 
 ALL_DATA = load_all_data()
@@ -183,18 +169,19 @@ class ForexMultiEnv(gym.Env):
         self.recent_rewards = deque(maxlen=SHARPE_WINDOW)
         return self._get_observation(self.current_step)
 
-    def _get_pip_value(self, symbol):
+    def _get_pip_value(self, symbol, price=1.0):
+        """Returns dollar value per pip per standard lot (100,000 units)"""
         if "JPY" in symbol:
-            return 0.01  # 1 pip = 0.01 for JPY pairs
+            return 1000 / price  # 1 pip = 0.01 JPY, 1 lot = 100,000 units → $10/1pip at 100 JPY/USD
         elif symbol == "XAUUSD":
-            return 0.1   # Gold typically uses 0.1 pip precision
+            return 10.0  # Gold: 1 pip = $10 per standard lot
         else:
-            return 0.0001  # Standard pairs
+            return 10.0  # Standard pairs: 1 pip = $10 per standard lot
 
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
-        atr_pips = row["ATR_14"]  # Now using scaled ATR values
+        current_price = row["open"]
 
         if row["high"] <= row["low"]:
             self.current_step += 1
@@ -231,31 +218,25 @@ class ForexMultiEnv(gym.Env):
             # Calculate risk amount (0.5% to 2% of balance)
             risk_amt = max(MIN_RISK * self.balance,
                           (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
-            
-            # Calculate stop distance in price units
-            pip_value = self._get_pip_value(symbol)
-            stop_distance_price = atr_pips * sl_mult
-            stop_distance_pips = stop_distance_price / pip_value
-            
-            # Calculate proper lot size
-            if "JPY" in symbol or symbol == "XAUUSD":
-                lot = (risk_amt / stop_distance_pips) * 100  # JPY/Gold adjustment
-            else:
-                lot = risk_amt / stop_distance_pips  # Normal pairs
 
+            # Convert ATR to pips and calculate stop distance
+            pip_value_unit = self._get_pip_value(symbol, 1.0)
+            atr_pips = row["ATR_14"] / pip_value_unit
+            stop_distance_pips = atr_pips * sl_mult
+            MIN_STOP_DISTANCE_PIPS = 20
+            stop_distance_pips = max(stop_distance_pips, MIN_STOP_DISTANCE_PIPS)
+
+            # Calculate lot size
+            dollar_per_pip_per_lot = self._get_pip_value(symbol, current_price)
+            lot = risk_amt / (stop_distance_pips * dollar_per_pip_per_lot)
             lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
-
-            # Debug output
-            if lot == MAX_LOT_SIZE:
-                print(f"\n[LOT SIZE WARNING] {symbol} at MAX_LOT_SIZE ({lot}) | "
-                      f"Risk: ${risk_amt:.2f} | ATR: {atr_pips:.6f} | "
-                      f"SL Mult: {sl_mult:.1f} | Stop Distance: {stop_distance_pips:.1f}pips")
 
             # Calculate prices
             direction = 1 if signal >= 0.5 else -1
             entry_price = row["open"]
-            sl_price = entry_price - direction * stop_distance_price
-            tp_price = entry_price + direction * atr_pips * tp_mult
+            pip_value = self._get_pip_value(symbol, entry_price)
+            sl_price = entry_price - direction * stop_distance_pips * pip_value
+            tp_price = entry_price + direction * atr_pips * tp_mult * pip_value
 
             # Risk-reward ratio
             risk_dist = abs(entry_price - sl_price)
@@ -282,11 +263,11 @@ class ForexMultiEnv(gym.Env):
                 self.total_trades += 1
                 self.recent_trades.append({**entry, "symbol": symbol})
 
-        # TRADE EXIT
+        # TRADE EXIT (FULLY WRITTEN OUT - NO PLACEHOLDERS)
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
-            pip_value = self._get_pip_value(symbol)
+            pip_value = self._get_pip_value(symbol, pos["entry_price"])
 
             # Check exit conditions
             if ((pos["direction"] == 1 and row["low"] <= pos["sl_price"]) or
@@ -294,7 +275,7 @@ class ForexMultiEnv(gym.Env):
                 exit_price = pos["sl_price"]
                 exit_reason = "SL"
                 # Add slippage
-                slippage = SLIPPAGE_RATIO * atr_pips
+                slippage = SLIPPAGE_RATIO * atr_pips * pip_value
                 exit_price += -pos["direction"] * slippage
 
             elif ((pos["direction"] == 1 and row["high"] >= pos["tp_price"]) or
@@ -344,40 +325,10 @@ class ForexMultiEnv(gym.Env):
                 std_r = SHARPE_EPSILON
             reward = (reward - mean_r) / std_r
 
-        # Print summary every 2 minutes
+        # Print summary every 2 minutes (only output wanted)
         if time.time() - self.last_summary_time >= 120:
             self.last_summary_time = time.time()
             print(f"\n[SUMMARY] Ep {self.current_episode} | Step {self.current_step}/{self.n_rows} | Bal ${self.balance:,.2f} | DD {self.max_drawdown:.2%} | Trades {self.total_trades}")
-
-            if self.open_positions:
-                print("\n=== OPEN TRADES ===")
-                for sym, trade in self.open_positions.items():
-                    print(f"{sym}: Direction {'LONG' if trade['direction'] == 1 else 'SHORT'} | "
-                          f"Entry: {trade['entry_price']:.5f} | "
-                          f"SL: {trade['sl_price']:.5f} | "
-                          f"TP: {trade['tp_price']:.5f} | "
-                          f"Lot: {trade['lot_size']:.2f} | "
-                          f"Confidence: {trade['confidence']:.2f}")
-
-            if self.recent_trades:
-                print("\n=== RECENT ENTRIES ===")
-                for trade in self.recent_trades[-5:]:
-                    print(f"{trade['symbol']}: {'LONG' if trade['direction'] == 1 else 'SHORT'} | "
-                          f"Entry: {trade['entry_price']:.5f} | "
-                          f"SL: {trade['sl_price']:.5f} | "
-                          f"TP: {trade['tp_price']:.5f} | "
-                          f"Lot: {trade['lot_size']:.2f} | "
-                          f"Confidence: {trade['confidence']:.2f}")
-
-            if self.recent_exits:
-                print("\n=== RECENT EXITS ===")
-                for trade in self.recent_exits[-5:]:
-                    print(f"{trade['symbol']}: Exit {trade['reason']} | "
-                          f"Entry: {trade['entry_price']:.5f} | "
-                          f"Exit: {trade['exit_price']:.5f} | "
-                          f"PNL: ${trade['pnl']:,.2f} | "
-                          f"Lot: {trade['lot_size']:.2f} | "
-                          f"Confidence: {trade['confidence']:.2f}")
 
         return self._get_observation(self.current_step), reward, done, {
             "balance": self.balance,
@@ -415,7 +366,6 @@ def train_agent():
         target_model_update=1e-3,
         batch_size=BATCH_SIZE
     )
-
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
 
     print("\nStarting training...")
@@ -426,7 +376,6 @@ def train_agent():
     os.makedirs(MODEL_DIR, exist_ok=True)
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
-
     stats = {
         "total_episodes": env.current_episode,
         "final_balance": env.balance,
