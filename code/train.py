@@ -178,6 +178,10 @@ class ForexMultiEnv(gym.Env):
         else:
             return 10.0  # Standard pairs: 1 pip = $10 per standard lot
 
+    def _get_pip_size(self, symbol):
+        """Returns the size of one pip for the given symbol"""
+        return 0.0001 if "JPY" not in symbol else 0.01
+
     def _print_recent_trades(self):
         """Prints the recent trades and exits in a formatted way"""
         if not self.recent_trades and not self.recent_exits:
@@ -238,24 +242,32 @@ class ForexMultiEnv(gym.Env):
             risk_amt = max(MIN_RISK * self.balance,
                           (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
 
-            # Convert ATR to pips and calculate stop distance
-            pip_value_unit = self._get_pip_value(symbol, 1.0)
-            atr_pips = row["ATR_14"] / pip_value_unit
+            # Get pip size and value
+            pip_size = self._get_pip_size(symbol)
+            pip_value = self._get_pip_value(symbol, current_price)
+            
+            # Calculate stop distance in pips
+            atr_pips = row["ATR_14"] / pip_size
             stop_distance_pips = atr_pips * sl_mult
             MIN_STOP_DISTANCE_PIPS = 20
             stop_distance_pips = max(stop_distance_pips, MIN_STOP_DISTANCE_PIPS)
 
             # Calculate lot size
-            dollar_per_pip_per_lot = self._get_pip_value(symbol, current_price)
+            dollar_per_pip_per_lot = pip_value
             lot = risk_amt / (stop_distance_pips * dollar_per_pip_per_lot)
             lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
 
             # Calculate prices
             direction = 1 if signal >= 0.5 else -1
             entry_price = row["open"]
-            pip_value = self._get_pip_value(symbol, entry_price)
-            sl_price = entry_price - direction * stop_distance_pips * pip_value
-            tp_price = entry_price + direction * atr_pips * tp_mult * pip_value
+            
+            # Calculate SL and TP prices correctly
+            if direction == 1:  # Buy
+                sl_price = entry_price - stop_distance_pips * pip_size
+                tp_price = entry_price + atr_pips * tp_mult * pip_size
+            else:  # Sell
+                sl_price = entry_price + stop_distance_pips * pip_size
+                tp_price = entry_price - atr_pips * tp_mult * pip_size
 
             # Risk-reward ratio
             risk_dist = abs(entry_price - sl_price)
@@ -286,8 +298,9 @@ class ForexMultiEnv(gym.Env):
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
+            pip_size = self._get_pip_size(symbol)
             pip_value = self._get_pip_value(symbol, pos["entry_price"])
-            atr_pips = row["ATR_14"] / pip_value_unit if 'pip_value_unit' in locals() else row["ATR_14"] / self._get_pip_value(symbol, 1.0)
+            atr_pips = row["ATR_14"] / pip_size
 
             # Check exit conditions
             if ((pos["direction"] == 1 and row["low"] <= pos["sl_price"]) or
@@ -295,7 +308,7 @@ class ForexMultiEnv(gym.Env):
                 exit_price = pos["sl_price"]
                 exit_reason = "SL"
                 # Add slippage
-                slippage = SLIPPAGE_RATIO * atr_pips * pip_value
+                slippage = SLIPPAGE_RATIO * atr_pips * pip_size
                 exit_price += -pos["direction"] * slippage
 
             elif ((pos["direction"] == 1 and row["high"] >= pos["tp_price"]) or
@@ -309,8 +322,13 @@ class ForexMultiEnv(gym.Env):
                 exit_reason = "SENT"
 
             if exit_price is not None:
-                pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
-                commission = COMMISSION_PIPS * pos["lot_size"]
+                # Correct P/L calculation
+                price_diff = exit_price - pos["entry_price"]
+                pnl = price_diff * pos["direction"] * pos["lot_size"] * (100000 if "XAU" not in symbol else 100)
+                if "JPY" in symbol and "USD" in symbol:
+                    pnl = price_diff * pos["direction"] * pos["lot_size"] * 1000 / exit_price
+                
+                commission = COMMISSION_PIPS * pos["lot_size"] * pip_value
                 pnl -= commission
                 self.balance += pnl
 
