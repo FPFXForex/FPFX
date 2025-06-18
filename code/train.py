@@ -53,7 +53,7 @@ SHARPE_EPSILON = 1e-5  # small value to avoid division by zero
 
 # ========== ENHANCEMENTS ==========
 MIN_SL_MULT = 1.0  # Minimum SL multiplier (1x ATR)
-MAX_SL_MULT = 3.0  # Maximum SL multiplier (3x ATR)
+MAX_SL_MULT = 5.0  # Maximum SL multiplier (5x ATR)
 MIN_TP_MULT = 1.0  # Minimum TP multiplier (1x ATR)
 MAX_TP_MULT = 5.0  # Maximum TP multiplier (5x ATR)
 SLIPPAGE_RATIO = 0.3  # Slippage as % of ATR
@@ -260,7 +260,9 @@ class ForexMultiEnv(gym.Env):
                 reward -= 10.0  # Heavy penalty for poor RR
                 
             # Calculate lot size (respects MIN_RISK/MAX_RISK)
-            lot = max(min(risk_amt / (atr * sl_mult / pip_val), MAX_LOT_SIZE), MIN_LOT_SIZE)
+            risk_per_pip = risk_amt / (atr * sl_mult)
+            lot = risk_per_pip / pip_val
+            lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
             
             if lot >= MIN_LOT_SIZE:
                 entry = {
