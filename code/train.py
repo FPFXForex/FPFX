@@ -57,6 +57,13 @@ MIN_TP_MULT = 1.0  # Minimum TP multiplier (1x ATR)
 MAX_TP_MULT = 5.0  # Maximum TP multiplier (5x ATR)
 SLIPPAGE_RATIO = 0.3  # Slippage as % of ATR
 
+# ========== UTILITY FUNCTIONS ==========
+def get_latest_checkpoint(checkpoint_dir):
+    checkpoints = glob.glob(os.path.join(checkpoint_dir, "*.h5f"))
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=os.path.getctime)
+
 # ========== DATA LOADING ==========
 def load_all_data():
     print("\n[1/4] Loading market data...")
@@ -68,9 +75,9 @@ def load_all_data():
             # Scale ATR only for forex, not Gold
             if sym != "XAUUSD":
                 df["ATR_14"] = df["ATR_14"] * 10
-                if "KC_upper" in df.columns:
-                    df["KC_upper"] = df["KC_upper"] * 10
-                    df["KC_lower"] = df["KC_lower"] * 10
+            if "KC_upper" in df.columns:
+                df["KC_upper"] = df["KC_upper"] * 10
+                df["KC_lower"] = df["KC_lower"] * 10
             df["symbol"] = sym
             frames.append(df)
         except Exception as e:
@@ -101,6 +108,7 @@ def load_all_data():
         all_df["date"] = all_df["time"].dt.tz_localize('UTC').dt.floor("D")
     else:
         all_df["date"] = all_df["time"].dt.tz_convert('UTC').dt.floor("D")
+
     all_df = all_df.merge(news, how="left", on=["date", "symbol"])
     all_df["news_count"] = all_df["news_count"].fillna(0)
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
@@ -118,6 +126,7 @@ def build_actor(input_shape, action_space):
     x = Dense(256, activation="relu")(x)
     x = Dense(128, activation="relu")(x)
     raw_actions = Dense(action_space.shape[0], activation="sigmoid", name="raw_actions")(x)
+    
     diff = action_space.high - action_space.low
     low = action_space.low
     actions = Lambda(lambda x, d=diff, l=low: x * d + l, name="actions")(raw_actions)
@@ -144,16 +153,19 @@ class ForexMultiEnv(gym.Env):
         self.symbol_to_id = {sym: i for i, sym in enumerate(SYMBOLS)}
         feature_cols = [c for c in self.all_data.columns if c not in ["time", "symbol", "date"]]
         self.feature_count = len(feature_cols)
+        
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(self.feature_count + len(SYMBOLS),),
             dtype=np.float32
         )
+        
         self.action_space = spaces.Box(
             low=np.array([0.0, MIN_SL_MULT, MIN_TP_MULT, -0.1, 0.0], dtype=np.float32),
             high=np.array([1.0, MAX_SL_MULT, MAX_TP_MULT, 0.1, 1.0], dtype=np.float32),
             dtype=np.float32
         )
+        
         self.initial_balance = initial_balance
         self.current_episode = 0
         self.features = self.all_data[feature_cols].values
@@ -185,58 +197,59 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
+        
         if row["high"] <= row["low"]:
             self.current_step += 1
             return self._get_observation(self.current_step), 0, False, {"balance": self.balance}
-
+        
         # Clip SL/TP multipliers to realistic ranges
         signal, sl_mult, tp_mult, sent_exit_thresh, confidence = np.clip(
-            action, 
+            action,
             [0.0, MIN_SL_MULT, MIN_TP_MULT, -0.1, 0.0],
             [1.0, MAX_SL_MULT, MAX_TP_MULT, 0.1, 1.0]
         )
-
+        
         # update drawdown
         self.balance = max(0, self.balance)
         self.max_balance = max(self.max_balance, self.balance)
         self.max_drawdown = max(self.max_drawdown,
-                              (self.max_balance - self.balance) / self.max_balance)
-
+                               (self.max_balance - self.balance) / self.max_balance)
+        
         # early reset
         if self.balance < 1000 or self.max_drawdown >= DAILY_DD_LIMIT:
             print(f"\n[EARLY RESET] Ep {self.current_episode} | Bal ${self.balance:.2f} | DD {self.max_drawdown:.2%}")
             return self.reset(), 0, True, {"balance": self.balance}
-
+        
         # forced first trade
         self.force_trade_counter += 1
         if not self.forced_first_trade and self.total_trades == 0 and self.force_trade_counter >= 3000:
             confidence = max(confidence, 0.5)
             self.forced_first_trade = True
-
+            
         reward = 0
-
+        
         # TRADE ENTRY
         if confidence >= FIXED_CONFIDENCE_THRESHOLD and len(self.open_positions) < MAX_OPEN_TRADES and symbol not in self.open_positions:
             atr = row["ATR_14"]
             pip_val = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
-
+            
             # Calculate risk amount (scales with confidence)
             risk_amt = max(MIN_RISK * self.balance,
                           (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
-
+            
             # Calculate risk-reward ratio
             direction = 1 if signal >= 0.5 else -1
             risk_dist = abs(row["open"] - (row["open"] - direction * atr * sl_mult))
             reward_dist = abs((row["open"] + direction * atr * tp_mult) - row["open"])
             rr_ratio = reward_dist / risk_dist
-
+            
             # Enforce minimum RR ratio of 1:1
             if rr_ratio < 1.0:
                 reward -= 10.0  # Heavy penalty for poor RR
-
+                
             # Calculate lot size (respects MIN_RISK/MAX_RISK)
             lot = max(min(risk_amt / (atr * sl_mult / pip_val), MAX_LOT_SIZE), MIN_LOT_SIZE)
-
+            
             if lot >= MIN_LOT_SIZE:
                 entry = {
                     "direction": direction,
@@ -253,13 +266,13 @@ class ForexMultiEnv(gym.Env):
                 self.episode_trades += 1
                 self.total_trades += 1
                 self.recent_trades.append({**entry, "symbol": symbol})
-
+        
         # TRADE EXIT
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
             pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
-
+            
             # Apply slippage to SL exits
             if ((pos["direction"] == 1 and row["low"] <= pos["sl_price"]) or
                 (pos["direction"] == -1 and row["high"] >= pos["sl_price"])):
@@ -268,11 +281,12 @@ class ForexMultiEnv(gym.Env):
                 # Add slippage (worst-case)
                 slippage = SLIPPAGE_RATIO * atr
                 exit_price += -pos["direction"] * slippage
+                
                 pnl = (exit_price - pos["entry_price"]) * pos["direction"] * (pos["lot_size"] / pip_value)
                 commission = COMMISSION_PIPS * pos["lot_size"]
                 pnl -= commission
                 reward = pnl * 2  # punish SL twice as heavy
-
+                
             elif ((pos["direction"] == 1 and row["high"] >= pos["tp_price"]) or
                   (pos["direction"] == -1 and row["low"] <= pos["tp_price"])):
                 exit_price = pos["tp_price"]
@@ -281,7 +295,7 @@ class ForexMultiEnv(gym.Env):
                 commission = COMMISSION_PIPS * pos["lot_size"]
                 pnl -= commission
                 reward = pnl  # reward equals actual profit
-
+                
             elif ((pos["direction"] == 1 and row["avg_sentiment"] <= pos["sent_exit_thresh"]) or
                   (pos["direction"] == -1 and row["avg_sentiment"] >= pos["sent_exit_thresh"])):
                 exit_price = row["close"]
@@ -290,17 +304,17 @@ class ForexMultiEnv(gym.Env):
                 commission = COMMISSION_PIPS * pos["lot_size"]
                 pnl -= commission
                 reward = pnl  # neutral / break-even
-
+                
             if exit_price is not None:
                 self.balance += pnl
                 time_held = self.current_step - pos["entry_step"]
                 reward = reward * pos["rr_ratio"]  # Scale by risk-reward ratio
                 reward -= time_held * TIME_PENALTY_FACTOR  # Time penalty
-
+                
                 # Confidence-based penalty for losses
                 if pnl < 0:
                     reward *= (1 + pos["confidence"])  # Increase penalty for high-confidence losses
-
+                    
                 self.recent_exits.append({
                     "symbol": symbol,
                     "reason": exit_reason,
@@ -313,11 +327,12 @@ class ForexMultiEnv(gym.Env):
                     "pnl": pnl
                 })
                 del self.open_positions[symbol]
-
+        
         self.current_step += 1
         done = self.current_step >= self.n_rows
+        
         next_obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
-
+        
         # Sharpe-like reward normalization
         self.recent_rewards.append(reward)
         if len(self.recent_rewards) >= 2:
@@ -326,12 +341,12 @@ class ForexMultiEnv(gym.Env):
             if std_r < SHARPE_EPSILON:
                 std_r = SHARPE_EPSILON
             reward = (reward - mean_r) / std_r
-
+        
         # Print summary every 2 minutes
         if time.time() - self.last_summary_time >= 120:
             print(f"\n[SUMMARY] Ep {self.current_episode} | Step {self.current_step}/{self.n_rows} | Bal ${self.balance:,.2f} | DD {self.max_drawdown:.2%} | Trades {self.total_trades}")
             # ... (rest of your summary logging remains unchanged)
-
+        
         return next_obs, reward, done, {"balance": self.balance, "max_drawdown": self.max_drawdown}
 
     def _get_observation(self, step):
@@ -345,13 +360,13 @@ class ForexMultiEnv(gym.Env):
 def train_agent():
     env = ForexMultiEnv(ALL_DATA)
     nb_actions = env.action_space.shape[0]
-
+    
     actor = build_actor((1,) + env.observation_space.shape, env.action_space)
     critic = build_critic((1,) + env.observation_space.shape, env.action_space)
-
+    
     memory = SequentialMemory(limit=MEMORY_LIMIT, window_length=1)
     rnd = OrnsteinUhlenbeckProcess(size=nb_actions, theta=0.15, mu=0.0, sigma=0.2, sigma_min=0.05)
-
+    
     agent = DDPGAgent(
         nb_actions=nb_actions,
         actor=actor,
@@ -365,23 +380,24 @@ def train_agent():
         target_model_update=1e-3,
         batch_size=BATCH_SIZE
     )
-
+    
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
-
+    
     latest = get_latest_checkpoint(CHECKPOINT_DIR)
     if latest:
         print(f"[RESUMING] Loading weights from: {latest}")
         agent.load_weights(latest)
-
+    
     print("\nStarting training...")
     callbacks = [CheckpointSaver(CHECKPOINT_DIR, interval=50000)]
     agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=0, callbacks=callbacks)
-
+    
     # Save models and stats
     print("\n[SAVING MODELS] Before evaluation...")
     os.makedirs(MODEL_DIR, exist_ok=True)
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
+    
     stats = {
         "total_episodes": env.current_episode,
         "final_balance": env.balance,
@@ -390,7 +406,7 @@ def train_agent():
     }
     joblib.dump(stats, os.path.join(MODEL_DIR, "training_stats.pkl"))
     print("[SAVED] All models and stats saved to disk")
-
+    
     # Evaluation
     print("\n=== EVALUATING LEARNED POLICY ===")
     global FIXED_CONFIDENCE_THRESHOLD
