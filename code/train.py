@@ -49,7 +49,7 @@ MAX_SL_MULT = 10.0
 MIN_TP_MULT = 1.0
 MAX_TP_MULT = 10.0
 SLIPPAGE_RATIO = 0.3
-MIN_STOP_DISTANCE_PIPS = 30
+MIN_STOP_DISTANCE_PIPS = 10
 
 # ========== DATA LOADING ==========
 def load_all_data():
