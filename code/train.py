@@ -20,7 +20,7 @@ from collections import deque
 
 # ========== CONFIGURATION ==========
 SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed")
 NEWS_CSV = os.path.join(BASE_DIR, "Data", "news_cache.csv")
 MODEL_DIR = os.path.join(BASE_DIR, "model")
