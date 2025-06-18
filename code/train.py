@@ -52,7 +52,7 @@ SHARPE_EPSILON = 1e-5  # small value to avoid division by zero
 
 # ========== ENHANCEMENTS ==========
 MIN_SL_MULT = 1.0  # Minimum SL multiplier (1x ATR)
-MAX_SL_MULT = 3.0  # Maximum SL multiplier (3x ATR)
+MAX_SL_MULT = 5.0  # Maximum SL multiplier (5x ATR)
 MIN_TP_MULT = 1.0  # Minimum TP multiplier (1x ATR)
 MAX_TP_MULT = 5.0  # Maximum TP multiplier (5x ATR)
 SLIPPAGE_RATIO = 0.3  # Slippage as % of ATR
@@ -208,6 +208,7 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
+        atr = row["ATR_14"]  # Moved this line up to make atr available for all cases
         
         if row["high"] <= row["low"]:
             self.current_step += 1
@@ -241,7 +242,6 @@ class ForexMultiEnv(gym.Env):
         
         # TRADE ENTRY
         if confidence >= FIXED_CONFIDENCE_THRESHOLD and len(self.open_positions) < MAX_OPEN_TRADES and symbol not in self.open_positions:
-            atr = row["ATR_14"]
             pip_val = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
             
             # Calculate risk amount (scales with confidence)
