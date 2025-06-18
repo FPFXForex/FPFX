@@ -31,7 +31,7 @@ MEMORY_LIMIT = 1000000
 BATCH_SIZE = 64
 OVERTRADE_BARS = 12
 MAX_OPEN_TRADES = 3
-DAILY_DD_LIMIT = 0.2
+DAILY_DD_LIMIT = 0.25  # Increased from 0.2 to 0.25
 MIN_RISK = 0.005  # 0.5% of balance
 MAX_RISK = 0.02   # 2% of balance
 FIXED_CONFIDENCE_THRESHOLD = 0.0
@@ -43,12 +43,13 @@ OPPORTUNITY_PENALTY = 10.0
 SHARPE_WINDOW = 1000
 SHARPE_EPSILON = 1e-5
 
-# Risk Management Parameters
+# Risk Management Parameters - Increased multipliers
 MIN_SL_MULT = 1.0
-MAX_SL_MULT = 5.0
+MAX_SL_MULT = 10.0  # Increased from 5.0 to 10.0
 MIN_TP_MULT = 1.0
-MAX_TP_MULT = 5.0
+MAX_TP_MULT = 10.0   # Increased from 5.0 to 10.0
 SLIPPAGE_RATIO = 0.3
+MIN_STOP_DISTANCE_PIPS = 30  # Increased from 20 to 30 pips
 
 # ========== DATA LOADING ==========
 def load_all_data():
@@ -258,8 +259,7 @@ class ForexMultiEnv(gym.Env):
             atr_pips = row["ATR_14"] / pip_size
             stop_distance_pips = atr_pips * sl_mult
             
-            # Ensure minimum stop distance (20 pips)
-            MIN_STOP_DISTANCE_PIPS = 20
+            # Ensure minimum stop distance (30 pips)
             stop_distance_pips = max(stop_distance_pips, MIN_STOP_DISTANCE_PIPS)
             
             # Calculate lot size based on risk amount and stop distance
@@ -274,18 +274,21 @@ class ForexMultiEnv(gym.Env):
             # Calculate SL and TP prices
             if direction == 1:  # Buy
                 sl_price = entry_price - stop_distance_pips * pip_size
-                tp_price = entry_price + stop_distance_pips * tp_mult * pip_size  # TP based on RR ratio
+                tp_price = entry_price + stop_distance_pips * tp_mult * pip_size
             else:  # Sell
                 sl_price = entry_price + stop_distance_pips * pip_size
-                tp_price = entry_price - stop_distance_pips * tp_mult * pip_size  # TP based on RR ratio
+                tp_price = entry_price - stop_distance_pips * tp_mult * pip_size
             
             # Risk-reward ratio
             risk_dist = abs(entry_price - sl_price)
             reward_dist = abs(tp_price - entry_price)
             rr_ratio = reward_dist / risk_dist if risk_dist > 0 else 1.0
             
+            # Additional checks for reasonable TP/SL distances
             if rr_ratio < 1.0:
                 reward -= 10.0  # Penalty for poor RR
+            elif rr_ratio > 5.0:
+                reward -= 5.0  # Small penalty for too aggressive RR
             
             if lot >= MIN_LOT_SIZE:
                 entry = {
