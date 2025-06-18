@@ -64,6 +64,17 @@ def get_latest_checkpoint(checkpoint_dir):
         return None
     return max(checkpoints, key=os.path.getctime)
 
+class CheckpointSaver(Callback):
+    def __init__(self, checkpoint_dir, interval=10000):
+        self.checkpoint_dir = checkpoint_dir
+        self.interval = interval
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+    def on_step_end(self, step, logs):
+        if step % self.interval == 0:
+            filepath = os.path.join(self.checkpoint_dir, f'checkpoint_{step}.h5f')
+            self.model.save_weights(filepath, overwrite=True)
+
 # ========== DATA LOADING ==========
 def load_all_data():
     print("\n[1/4] Loading market data...")
@@ -213,7 +224,7 @@ class ForexMultiEnv(gym.Env):
         self.balance = max(0, self.balance)
         self.max_balance = max(self.max_balance, self.balance)
         self.max_drawdown = max(self.max_drawdown,
-                               (self.max_balance - self.balance) / self.max_balance)
+                              (self.max_balance - self.balance) / self.max_balance)
         
         # early reset
         if self.balance < 1000 or self.max_drawdown >= DAILY_DD_LIMIT:
