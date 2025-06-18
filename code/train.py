@@ -29,7 +29,7 @@ CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Hyperparameters
+# Hyperparameters (UNCHANGED)
 INITIAL_BALANCE = 100000.0
 DISCOUNT_FACTOR = 0.99
 TRAIN_STEPS = 700000
@@ -37,26 +37,22 @@ MEMORY_LIMIT = 1000000
 BATCH_SIZE = 64
 OVERTRADE_BARS = 12
 MAX_OPEN_TRADES = 3
-DAILY_DD_LIMIT = 0.2  # 20% max daily drawdown
-MIN_RISK = 0.005  # 0.5% per trade
-MAX_RISK = 0.02  # 2% per trade
-FIXED_CONFIDENCE_THRESHOLD = 0.0  # exploration during training
+DAILY_DD_LIMIT = 0.2
+MIN_RISK = 0.005
+MAX_RISK = 0.02
+FIXED_CONFIDENCE_THRESHOLD = 0.0
 MIN_LOT_SIZE = 0.1
-MAX_LOT_SIZE = 20.0  # Increased maximum lot size to 20
-COMMISSION_PIPS = 0.02  # 0.02 pips per trade commission
-
-# New hyperparameters for reward modifications
-TIME_PENALTY_FACTOR = 0.1  # penalty per bar held
-OPPORTUNITY_PENALTY = 10.0  # penalty for missed opportunities
-SHARPE_WINDOW = 1000  # window size for reward statistics
-SHARPE_EPSILON = 1e-5  # small value to avoid division by zero
-
-# ========== ENHANCEMENTS ==========
-MIN_SL_MULT = 1.0  # Minimum SL multiplier (1x ATR)
-MAX_SL_MULT = 5.0  # Maximum SL multiplier (5x ATR)
-MIN_TP_MULT = 1.0  # Minimum TP multiplier (1x ATR)
-MAX_TP_MULT = 5.0  # Maximum TP multiplier (5x ATR)
-SLIPPAGE_RATIO = 0.3  # Slippage as % of ATR
+MAX_LOT_SIZE = 20.0
+COMMISSION_PIPS = 0.02
+TIME_PENALTY_FACTOR = 0.1
+OPPORTUNITY_PENALTY = 10.0
+SHARPE_WINDOW = 1000
+SHARPE_EPSILON = 1e-5
+MIN_SL_MULT = 1.0
+MAX_SL_MULT = 5.0
+MIN_TP_MULT = 1.0
+MAX_TP_MULT = 5.0
+SLIPPAGE_RATIO = 0.3
 
 # ========== UTILITY FUNCTIONS ==========
 def get_latest_checkpoint(checkpoint_dir):
@@ -84,9 +80,8 @@ def load_all_data():
         path = os.path.join(DATA_DIR, f"{sym}_processed.csv")
         try:
             df = pd.read_csv(path, parse_dates=["time"])
-            # Scale ATR only for forex, not Gold
             if sym != "XAUUSD":
-                df["ATR_14"] = df["ATR_14"] * 10
+                df["ATR_14"] = df["ATR_14"] * 10  # KEEP YOUR 10x SCALING
             if "KC_upper" in df.columns:
                 df["KC_upper"] = df["KC_upper"] * 10
                 df["KC_lower"] = df["KC_lower"] * 10
@@ -209,7 +204,7 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
-        atr = row["ATR_14"]
+        atr = row["ATR_14"]  # Already scaled by 10x in load_all_data()
         
         if row["high"] <= row["low"]:
             self.current_step += 1
@@ -243,11 +238,19 @@ class ForexMultiEnv(gym.Env):
         
         # TRADE ENTRY
         if confidence >= FIXED_CONFIDENCE_THRESHOLD and len(self.open_positions) < MAX_OPEN_TRADES and symbol not in self.open_positions:
-            pip_val = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
+            pip_value = 0.0001  # Default for most pairs
+            if "JPY" in symbol or symbol == "XAUUSD":
+                pip_value = 0.01
             
-            # Calculate risk amount (scales with confidence)
+            # Calculate risk amount (0.5% to 2% of balance)
             risk_amt = max(MIN_RISK * self.balance,
                           (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
+            
+            # CORRECTED LOT SIZE CALCULATION
+            stop_distance_price = atr * sl_mult  # Stop distance in price units
+            risk_per_lot = stop_distance_price / pip_value  # Risk per 1 lot
+            lot = risk_amt / risk_per_lot  # Proper lot size
+            lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
             
             # Calculate risk-reward ratio
             direction = 1 if signal >= 0.5 else -1
@@ -259,11 +262,6 @@ class ForexMultiEnv(gym.Env):
             if rr_ratio < 1.0:
                 reward -= 10.0  # Heavy penalty for poor RR
                 
-            # Calculate lot size (respects MIN_RISK/MAX_RISK)
-            risk_per_pip = risk_amt / (atr * sl_mult)
-            lot = risk_per_pip / pip_val
-            lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
-            
             if lot >= MIN_LOT_SIZE:
                 entry = {
                     "direction": direction,
@@ -281,7 +279,7 @@ class ForexMultiEnv(gym.Env):
                 self.total_trades += 1
                 self.recent_trades.append({**entry, "symbol": symbol})
         
-        # TRADE EXIT
+        # TRADE EXIT (UNCHANGED)
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
             exit_price, exit_reason = None, None
@@ -292,7 +290,6 @@ class ForexMultiEnv(gym.Env):
                 (pos["direction"] == -1 and row["high"] >= pos["sl_price"])):
                 exit_price = pos["sl_price"]
                 exit_reason = "SL"
-                # Add slippage (worst-case)
                 slippage = SLIPPAGE_RATIO * atr
                 exit_price += -pos["direction"] * slippage
                 
@@ -356,7 +353,7 @@ class ForexMultiEnv(gym.Env):
                 std_r = SHARPE_EPSILON
             reward = (reward - mean_r) / std_r
         
-        # Print comprehensive summary every 2 minutes
+        # Print summary every 2 minutes
         if time.time() - self.last_summary_time >= 120:
             self.last_summary_time = time.time()
             print(f"\n[SUMMARY] Ep {self.current_episode} | Step {self.current_step}/{self.n_rows} | Bal ${self.balance:,.2f} | DD {self.max_drawdown:.2%} | Trades {self.total_trades}")
@@ -373,7 +370,7 @@ class ForexMultiEnv(gym.Env):
             
             if self.recent_trades:
                 print("\n=== RECENT ENTRIES ===")
-                for trade in self.recent_trades[-5:]:  # Show last 5 entries
+                for trade in self.recent_trades[-5:]:
                     print(f"{trade['symbol']}: {'LONG' if trade['direction'] == 1 else 'SHORT'} | "
                           f"Entry: {trade['entry_price']:.5f} | "
                           f"SL: {trade['sl_price']:.5f} | "
@@ -383,7 +380,7 @@ class ForexMultiEnv(gym.Env):
             
             if self.recent_exits:
                 print("\n=== RECENT EXITS ===")
-                for trade in self.recent_exits[-5:]:  # Show last 5 exits
+                for trade in self.recent_exits[-5:]:
                     print(f"{trade['symbol']}: Exit {trade['reason']} | "
                           f"Entry: {trade['entry_price']:.5f} | "
                           f"Exit: {trade['exit_price']:.5f} | "
