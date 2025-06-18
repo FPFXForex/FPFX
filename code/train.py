@@ -116,8 +116,7 @@ class ForexMultiEnv(gym.Env):
         )
         self.initial_balance = initial_balance
         self.current_episode = 0
-        self.features = self.all_data[feature_cols].values
-        self.scaler = StandardScaler().fit(self.features)
+        self.scaler = StandardScaler().fit(self.all_data[feature_cols].values)
         self.forced_first_trade = False
         self.recent_trades = []
         self.recent_exits = []
@@ -137,7 +136,7 @@ class ForexMultiEnv(gym.Env):
         self.recent_trades.clear()
         self.recent_exits.clear()
         self.current_episode += 1
-        return self._get_observation(self.current_step)
+        return self._get_observation(0)
 
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
@@ -155,7 +154,7 @@ class ForexMultiEnv(gym.Env):
                                 (self.max_balance - self.balance) / self.max_balance)
 
         if self.balance < 1000 or self.max_drawdown >= DAILY_DD_LIMIT:
-            print(f"\n[EARLY RESET] Ep {self.current_episode} | Bal ${self.balance:.2f} | DD {self.max_drawdown:.2%}")
+            print(f"\n[EARLY RESET] Ep{self.current_episode} | Bal ${self.balance:.2f} | DD {self.max_drawdown:.2%}")
             return self.reset(), 0, True, {}
 
         self.force_trade_counter += 1
@@ -190,16 +189,16 @@ class ForexMultiEnv(gym.Env):
         # TRADE EXIT
         if symbol in self.open_positions:
             pos = self.open_positions[symbol]
-            exit_price, reason = None, None
+            exit_price = None
             if (pos["direction"] == 1 and row["low"] <= pos["sl"]) or \
                (pos["direction"] == -1 and row["high"] >= pos["sl"]):
-                exit_price, reason, reward = pos["sl"], "SL", -abs(pos["lot"] * 2)
+                exit_price, reward = pos["sl"], -abs(pos["lot"] * 2)
             elif (pos["direction"] == 1 and row["high"] >= pos["tp"]) or \
                  (pos["direction"] == -1 and row["low"] <= pos["tp"]):
-                exit_price, reason, reward = pos["tp"], "TP", pos["lot"]
+                exit_price, reward = pos["tp"], pos["lot"]
             elif (pos["direction"] == 1 and row["avg_sentiment"] <= sent_exit) or \
                  (pos["direction"] == -1 and row["avg_sentiment"] >= sent_exit):
-                exit_price, reason, reward = row["close"], "SENT", 0
+                exit_price, reward = row["close"], 0
 
             if exit_price is not None:
                 pv = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
@@ -212,17 +211,18 @@ class ForexMultiEnv(gym.Env):
         done = self.current_step >= self.n_rows
         obs = np.zeros_like(self.observation_space.low) if done else self._get_observation(self.current_step)
 
-        # aggregated summary every 120 seconds
+        # aggregated summary every 2 minutes (120s)
         if time.time() - self.last_summary_time >= 120:
             ecount = len(self.recent_trades)
             xcount = len(self.recent_exits)
-            aec = (np.mean([t["confidence"] for t in self.recent_trades]) if ecount else 0.0)
-            axc = (np.mean([e["confidence"] for e in self.recent_exits]) if xcount else 0.0)
+            aec = np.mean([t["confidence"] for t in self.recent_trades]) if ecount else 0.0
+            axc = np.mean([e["confidence"] for e in self.recent_exits]) if xcount else 0.0
             xpnl = sum(e["pnl"] for e in self.recent_exits)
             print(f"\n[SUMMARY] Ep{self.current_episode} | Step{self.current_step}/{self.n_rows} "
                   f"| Bal${self.balance:,.2f} | DD{self.max_drawdown:.2%} | Tot{self.total_trades}")
             print(f" Entries:{ecount} | AvgConf:{aec:.3f}")
             print(f" Exits:{xcount} | PnL:{xpnl:+.2f} | AvgConf:{axc:.3f}")
+            print(f"[HEARTBEAT] Step: {self.current_step}, Balance: ${self.balance:.2f}")
             self.recent_trades.clear()
             self.recent_exits.clear()
             self.last_summary_time = time.time()
@@ -232,8 +232,7 @@ class ForexMultiEnv(gym.Env):
     def _get_observation(self, step):
         row = self.all_data.iloc[step]
         feats = self.scaler.transform([row.drop(["time", "symbol", "date"]).values])[0]
-        oh = np.zeros(len(SYMBOLS))
-        oh[self.symbol_to_id[row["symbol"]]] = 1
+        oh = np.zeros(len(SYMBOLS)); oh[self.symbol_to_id[row["symbol"]]] = 1
         return np.concatenate([feats, oh])
 
 # ========== CHECKPOINT CALLBACK ==========
@@ -290,7 +289,7 @@ def train_agent():
     )
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
 
-    # resume from latest checkpoint
+    # resume from latest checkpoint if any
     latest = get_latest_checkpoint(CHECKPOINT_DIR)
     if latest:
         print(f"[RESUME] loading {latest}")
@@ -303,7 +302,7 @@ def train_agent():
     ]
     agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=0, callbacks=callbacks)
 
-    # final saves
+    # final save
     actor.save(os.path.join(MODEL_DIR, "actor.h5"))
     agent.save_weights(os.path.join(MODEL_DIR, "ddpg_weights.h5f"), overwrite=True)
     joblib.dump({
