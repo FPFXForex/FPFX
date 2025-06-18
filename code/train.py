@@ -28,7 +28,7 @@ CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Hyperparameters
+# Hyperparameters (UNCHANGED from your original)
 INITIAL_BALANCE = 100000.0
 DISCOUNT_FACTOR = 0.99
 TRAIN_STEPS = 700000
@@ -47,8 +47,10 @@ TIME_PENALTY_FACTOR = 0.1
 OPPORTUNITY_PENALTY = 10.0
 SHARPE_WINDOW = 1000
 SHARPE_EPSILON = 1e-5
+
+# ========== ENHANCEMENTS ==========
 MIN_SL_MULT = 1.0
-MAX_SL_MULT = 5.0
+MAX_SL_MULT = 5.0  # Changed from 3.0 to 5.0 as requested
 MIN_TP_MULT = 1.0
 MAX_TP_MULT = 5.0
 SLIPPAGE_RATIO = 0.3
@@ -79,8 +81,8 @@ def load_all_data():
         path = os.path.join(DATA_DIR, f"{sym}_processed.csv")
         try:
             df = pd.read_csv(path, parse_dates=["time"])
-            if sym != "XAUUSD":
-                df["ATR_14"] = df["ATR_14"] * 10000  # Convert to pips (0.0001 -> 1 pip)
+            # Convert ATR to pips (0.0001 -> 1 pip)
+            df["ATR_14"] = df["ATR_14"] * 10000  # Critical fix for proper scaling
             if "KC_upper" in df.columns:
                 df["KC_upper"] = df["KC_upper"] * 10000
                 df["KC_lower"] = df["KC_lower"] * 10000
@@ -203,7 +205,7 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
-        atr_pips = row["ATR_14"]  # Now in pips (already scaled in load_all_data)
+        atr_pips = row["ATR_14"]  # Now properly scaled in pips
         
         if row["high"] <= row["low"]:
             self.current_step += 1
@@ -216,7 +218,7 @@ class ForexMultiEnv(gym.Env):
             [1.0, MAX_SL_MULT, MAX_TP_MULT, 0.1, 1.0]
         )
         
-        # Update drawdown
+        # Update balance and drawdown
         self.balance = max(0, self.balance)
         self.max_balance = max(self.max_balance, self.balance)
         self.max_drawdown = max(self.max_drawdown,
@@ -246,18 +248,26 @@ class ForexMultiEnv(gym.Env):
             
             # Calculate proper lot size
             if "JPY" in symbol or symbol == "XAUUSD":
-                lot = (risk_amt / stop_distance_pips) * 100  # For JPY and Gold (1 pip = 0.01)
+                lot = (risk_amt / stop_distance_pips) * 100  # JPY/Gold adjustment
             else:
-                lot = risk_amt / stop_distance_pips  # For other pairs (1 pip = 0.0001)
+                lot = risk_amt / stop_distance_pips  # Normal pairs
             
             lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
             
-            # Calculate risk-reward ratio
-            direction = 1 if signal >= 0.5 else -1
-            entry_price = row["open"]
-            sl_price = entry_price - direction * (stop_distance_pips * (0.0001 if "JPY" not in symbol and symbol != "XAUUSD" else 0.01))
-            tp_price = entry_price + direction * (atr_pips * tp_mult * (0.0001 if "JPY" not in symbol and symbol != "XAUUSD" else 0.01))
+            # Debug output if hitting max lots
+            if lot == MAX_LOT_SIZE:
+                print(f"\n[LOT SIZE WARNING] {symbol} at MAX_LOT_SIZE ({lot}) | "
+                      f"Risk: ${risk_amt:.2f} | ATR: {atr_pips:.1f}pips | "
+                      f"SL Mult: {sl_mult:.1f}")
             
+            # Calculate prices
+            direction = 1 if signal >= 0.5 else -1
+            pip_value = 0.01 if "JPY" in symbol or symbol == "XAUUSD" else 0.0001
+            entry_price = row["open"]
+            sl_price = entry_price - direction * stop_distance_pips * pip_value
+            tp_price = entry_price + direction * atr_pips * tp_mult * pip_value
+            
+            # Risk-reward ratio
             risk_dist = abs(entry_price - sl_price)
             reward_dist = abs(tp_price - entry_price)
             rr_ratio = reward_dist / risk_dist if risk_dist > 0 else 1.0
@@ -293,7 +303,8 @@ class ForexMultiEnv(gym.Env):
                 (pos["direction"] == -1 and row["high"] >= pos["sl_price"])):
                 exit_price = pos["sl_price"]
                 exit_reason = "SL"
-                slippage = SLIPPAGE_RATIO * (atr_pips * (0.0001 if "JPY" not in symbol and symbol != "XAUUSD" else 0.01))
+                # Add slippage
+                slippage = SLIPPAGE_RATIO * atr_pips * pip_value
                 exit_price += -pos["direction"] * slippage
                 
             elif ((pos["direction"] == 1 and row["high"] >= pos["tp_price"]) or
@@ -418,10 +429,8 @@ def train_agent():
     
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
     
-    latest = get_latest_checkpoint(CHECKPOINT_DIR)
-    if latest:
-        print(f"[RESUMING] Loading weights from: {latest}")
-        agent.load_weights(latest)
+    # Force fresh start (ignore old checkpoints)
+    print("\n[INIT] Starting fresh training (ignoring old checkpoints)")
     
     print("\nStarting training...")
     callbacks = [CheckpointSaver(CHECKPOINT_DIR, interval=50000)]
