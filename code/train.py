@@ -1,6 +1,4 @@
 import os
-import random
-import glob
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -15,7 +13,6 @@ from rl.memory import SequentialMemory
 from rl.random import OrnsteinUhlenbeckProcess
 from tensorflow.keras.optimizers import Adam
 import time
-from rl.callbacks import Callback
 from collections import deque
 
 # ========== CONFIGURATION ==========
@@ -24,11 +21,9 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed")
 NEWS_CSV = os.path.join(BASE_DIR, "Data", "news_cache.csv")
 MODEL_DIR = os.path.join(BASE_DIR, "model")
-CHECKPOINT_DIR = os.path.join(MODEL_DIR, "checkpoints")
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Hyperparameters (UNCHANGED from your original)
+# Hyperparameters
 INITIAL_BALANCE = 100000.0
 DISCOUNT_FACTOR = 0.99
 TRAIN_STEPS = 700000
@@ -48,30 +43,13 @@ OPPORTUNITY_PENALTY = 10.0
 SHARPE_WINDOW = 1000
 SHARPE_EPSILON = 1e-5
 
-# ========== ENHANCEMENTS ==========
+# Risk Management Parameters
 MIN_SL_MULT = 1.0
-MAX_SL_MULT = 5.0 # Changed from 3.0 to 5.0 as requested
+MAX_SL_MULT = 5.0
 MIN_TP_MULT = 1.0
 MAX_TP_MULT = 5.0
 SLIPPAGE_RATIO = 0.3
-
-# ========== UTILITY FUNCTIONS ==========
-def get_latest_checkpoint(checkpoint_dir):
-    checkpoints = glob.glob(os.path.join(checkpoint_dir, "*.h5f"))
-    if not checkpoints:
-        return None
-    return max(checkpoints, key=os.path.getctime)
-
-class CheckpointSaver(Callback):
-    def __init__(self, checkpoint_dir, interval=10000):
-        self.checkpoint_dir = checkpoint_dir
-        self.interval = interval
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
-    def on_step_end(self, step, logs):
-        if step % self.interval == 0:
-            filepath = os.path.join(self.checkpoint_dir, f'checkpoint_{step}.h5f')
-            self.model.save_weights(filepath, overwrite=True)
+ATR_SCALING_FACTOR = 10  # Scale ATR values to make them more usable
 
 # ========== DATA LOADING ==========
 def load_all_data():
@@ -81,14 +59,20 @@ def load_all_data():
         path = os.path.join(DATA_DIR, f"{sym}_processed.csv")
         try:
             df = pd.read_csv(path, parse_dates=["time"])
-            # Remove ATR scaling - use raw values
+            
+            # Scale ATR values to make them usable for stop distance calculation
+            df["ATR_14"] = df["ATR_14"] * ATR_SCALING_FACTOR
+            
+            # Scale KC bands similarly if they exist
             if "KC_upper" in df.columns:
-                df["KC_upper"] = df["KC_upper"] * 10000
-                df["KC_lower"] = df["KC_lower"] * 10000
+                df["KC_upper"] = df["KC_upper"] * ATR_SCALING_FACTOR
+                df["KC_lower"] = df["KC_lower"] * ATR_SCALING_FACTOR
+            
             df["symbol"] = sym
             frames.append(df)
         except Exception as e:
             print(f"Error loading {sym}: {e}")
+    
     all_df = pd.concat(frames, ignore_index=True)
     all_df.sort_values(by=["time", "symbol"], inplace=True)
 
@@ -97,6 +81,7 @@ def load_all_data():
         news = pd.read_csv(NEWS_CSV, parse_dates=["date"])
         if news["date"].dt.tz is None:
             news["date"] = news["date"].dt.tz_localize('UTC')
+        
         all_dates = pd.date_range(
             start=all_df["time"].min().floor("D"),
             end=all_df["time"].max().ceil("D"),
@@ -121,6 +106,7 @@ def load_all_data():
     all_df["avg_sentiment"] = all_df["avg_sentiment"].fillna(0.0)
     all_df.fillna(method="ffill", inplace=True)
     all_df.fillna(0.0, inplace=True)
+    
     return all_df
 
 ALL_DATA = load_all_data()
@@ -208,7 +194,7 @@ class ForexMultiEnv(gym.Env):
     def step(self, action):
         row = self.all_data.iloc[self.current_step]
         symbol = row["symbol"]
-        atr_pips = row["ATR_14"]  # Now using raw ATR values
+        atr_pips = row["ATR_14"]  # Now using scaled ATR values
 
         if row["high"] <= row["low"]:
             self.current_step += 1
@@ -245,16 +231,12 @@ class ForexMultiEnv(gym.Env):
             # Calculate risk amount (0.5% to 2% of balance)
             risk_amt = max(MIN_RISK * self.balance,
                           (MIN_RISK + confidence * (MAX_RISK - MIN_RISK)) * self.balance)
-
-            # Calculate stop distance in price units and convert to pips
+            
+            # Calculate stop distance in price units
             pip_value = self._get_pip_value(symbol)
             stop_distance_price = atr_pips * sl_mult
             stop_distance_pips = stop_distance_price / pip_value
-
-            # Add minimum stop distance protection
-            MIN_STOP_DISTANCE_PIPS = 10
-            stop_distance_pips = max(stop_distance_pips, MIN_STOP_DISTANCE_PIPS)
-
+            
             # Calculate proper lot size
             if "JPY" in symbol or symbol == "XAUUSD":
                 lot = (risk_amt / stop_distance_pips) * 100  # JPY/Gold adjustment
@@ -263,7 +245,7 @@ class ForexMultiEnv(gym.Env):
 
             lot = max(min(lot, MAX_LOT_SIZE), MIN_LOT_SIZE)
 
-            # Debug output if hitting max lots
+            # Debug output
             if lot == MAX_LOT_SIZE:
                 print(f"\n[LOT SIZE WARNING] {symbol} at MAX_LOT_SIZE ({lot}) | "
                       f"Risk: ${risk_amt:.2f} | ATR: {atr_pips:.6f} | "
@@ -436,12 +418,8 @@ def train_agent():
 
     agent.compile(Adam(learning_rate=1e-4), metrics=["mae"])
 
-    # Force fresh start (ignore old checkpoints)
-    print("\n[INIT] Starting fresh training (ignoring old checkpoints)")
     print("\nStarting training...")
-
-    callbacks = [CheckpointSaver(CHECKPOINT_DIR, interval=50000)]
-    agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=0, callbacks=callbacks)
+    agent.fit(env, nb_steps=TRAIN_STEPS, visualize=False, verbose=0)
 
     # Save models and stats
     print("\n[SAVING MODELS] Before evaluation...")
