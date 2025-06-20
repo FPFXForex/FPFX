@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 
 """
-
-OPTIMIZED FOREX AI TRAINER - Correct Paths for FPFX Structure
-
+OPTIMIZED FOREX AI TRAINER - Fixed Version for RunPod RTX 4000 Ada
 """
 
 import os
@@ -22,9 +20,12 @@ from sklearn.preprocessing import RobustScaler
 from collections import deque, namedtuple
 import gym
 from gym import spaces
+import warnings
+
+# Suppress Gym warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="gym")
 
 # ================ CONFIG WITH FPFX PATHS ================
-
 class Config:
     # Core parameters
     SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
@@ -51,8 +52,8 @@ class Config:
     EXPLORATION_DECAY = 0.65
 
     # Neural network architecture
-    FEATURE_DIM = 26  # Updated to match actual feature count (24 time steps x 26 features)
-    TEMPORAL_DIM = 128
+    FEATURE_DIM = 26  # 24 time steps x 26 features
+    TEMPORAL_DIM = 256  # Increased to match LSTM output
     POLICY_DIM = 256
 
     # Training optimization
@@ -64,11 +65,11 @@ class Config:
     N_EPOCHS = 3
 
     # System - FPFX Directory Structure
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # root/FPFX
-    MODEL_DIR = os.path.join(BASE_DIR, "model") # root/FPFX/model
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # root/FPFX
+    MODEL_DIR = os.path.join(BASE_DIR, "model")  # root/FPFX/model
     LOG_DIR = os.path.join(BASE_DIR, "logs")
-    DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed") # root/FPFX/Data/processed
-    NEWS_PATH = os.path.join(BASE_DIR, "Data", "news_cache.csv") # root/FPFX/Data/news_cache.csv
+    DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed")  # root/FPFX/Data/processed
+    NEWS_PATH = os.path.join(BASE_DIR, "Data", "news_cache.csv")  # root/FPFX/Data/news_cache.csv
     SAVE_INTERVAL = 100000
     USE_AMP = True if torch.cuda.is_available() else False
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,7 +91,6 @@ logger.info("Model directory: %s", Config.MODEL_DIR)
 logger.info("Data directory: %s", Config.DATA_DIR)
 
 # ================ DATA ENGINEERING ================
-
 class ForexDataEngine:
     def __init__(self):
         self.data = self.load_and_process()
@@ -109,7 +109,7 @@ class ForexDataEngine:
                 df['hour'] = df['time'].dt.hour.astype(np.float32)
                 df['day_of_week'] = df['time'].dt.dayofweek.astype(np.float32)
                 df['volatility'] = ((df['high'] - df['low']) / 
-                                   df['close'].shift(1).replace(0, 1)).fillna(0).astype(np.float32)
+                                  df['close'].shift(1).replace(0, 1)).fillna(0).astype(np.float32)
                 data[symbol] = df
                 logger.info("Loaded %d rows for %s", len(df), symbol)
             except Exception as e:
@@ -119,19 +119,17 @@ class ForexDataEngine:
         # Load news data
         logger.info("Loading news from: %s", Config.NEWS_PATH)
         news_df = self.load_news_data()
-        
+
         # Convert date columns to same type before merge
         if not news_df.empty:
             news_df['date'] = pd.to_datetime(news_df['date']).dt.date
-            
-        for symbol, df in data.items():
-            df['date'] = df['time'].dt.date
-            if not news_df.empty:
-                df = pd.merge(df, news_df, how='left', on=['date', 'symbol'])
-            df['news_count'] = df['news_count'].fillna(0).astype(np.float32)
-            df['avg_sentiment'] = df['avg_sentiment'].fillna(0).astype(np.float32)
-            data[symbol] = df
-
+            for symbol, df in data.items():
+                df['date'] = df['time'].dt.date
+                if not news_df.empty:
+                    df = pd.merge(df, news_df, how='left', on=['date', 'symbol'])
+                    df['news_count'] = df['news_count'].fillna(0).astype(np.float32)
+                    df['avg_sentiment'] = df['avg_sentiment'].fillna(0).astype(np.float32)
+                data[symbol] = df
         return data
 
     def load_news_data(self):
@@ -151,7 +149,6 @@ class ForexDataEngine:
         scalers = {}
         all_data = pd.concat(self.data.values())
 
-        # Updated to include all technical indicators from the processed data
         tech_cols = ['RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
                     'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
                     'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
@@ -170,7 +167,6 @@ class ForexDataEngine:
 
         seq = df.iloc[index-seq_len:index]
 
-        # Updated to include all technical indicators
         tech = self.scalers['tech'].transform(seq[[
             'RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
             'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
@@ -180,8 +176,8 @@ class ForexDataEngine:
 
         price = self.scalers['price'].transform(seq[['open', 'high', 'low', 'close']])
         temporal = np.stack([seq['hour'].values, seq['day_of_week'].values], axis=-1)
-        features = np.concatenate([tech, price, temporal], axis=1)
 
+        features = np.concatenate([tech, price, temporal], axis=1)
         return {
             'features': features.astype(np.float32),
             'current_price': df.iloc[index]['close'],
@@ -189,55 +185,56 @@ class ForexDataEngine:
         }
 
 # ================ MODEL ARCHITECTURE ================
-
 class TemporalFeatureExtractor(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
-        self.lstm = nn.LSTM(input_dim, Config.TEMPORAL_DIM//2,
-                           batch_first=True, bidirectional=True)
-        self.conv = nn.Conv1d(input_dim, Config.TEMPORAL_DIM//2, kernel_size=3, padding=1)
+        self.lstm = nn.LSTM(input_dim, Config.TEMPORAL_DIM, batch_first=True)
+        self.layer_norm = nn.LayerNorm(Config.TEMPORAL_DIM)
 
     def forward(self, x):
         # x shape: (batch_size, seq_len, input_dim)
-        lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, TEMPORAL_DIM//2 * 2)
-        cnn_out = x.transpose(1, 2)  # (batch_size, input_dim, seq_len)
-        cnn_out = torch.relu(self.conv(cnn_out)).transpose(1, 2)  # (batch_size, seq_len, TEMPORAL_DIM//2)
-        combined = torch.cat([lstm_out, cnn_out], dim=-1)  # (batch_size, seq_len, TEMPORAL_DIM)
-        return combined[:, -1, :]  # (batch_size, TEMPORAL_DIM)
+        lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, TEMPORAL_DIM)
+        lstm_out = self.layer_norm(lstm_out)
+        return lstm_out[:, -1, :]  # (batch_size, TEMPORAL_DIM)
 
 class ForexPolicyNetwork(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
         self.feature_extractor = TemporalFeatureExtractor(input_dim)
+        
+        # Policy head
         self.policy_fc = nn.Sequential(
             nn.Linear(Config.TEMPORAL_DIM, Config.POLICY_DIM),
             nn.ReLU(),
-            nn.Linear(Config.POLICY_DIM, 10)
+            nn.Linear(Config.POLICY_DIM, 10)  # 5 means + 5 stds
         )
+        
+        # Value head
         self.value_fc = nn.Sequential(
             nn.Linear(Config.TEMPORAL_DIM, Config.POLICY_DIM),
             nn.ReLU(),
             nn.Linear(Config.POLICY_DIM, 1)
         )
+        
         self.action_bounds = torch.tensor([
             [0.0, 1.0], [1.0, 4.0], [1.5, 6.0], [-0.3, 0.3], [0.0, 1.0]
         ], device=Config.DEVICE)
 
     def forward(self, x):
-        # Ensure input is properly shaped: (batch_size, seq_len, input_dim)
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # Add batch dimension if missing
+            x = x.unsqueeze(0)
             
         features = self.feature_extractor(x)
         policy_params = self.policy_fc(features)
+        
         means = policy_params[..., :5]
         stds = torch.nn.functional.softplus(policy_params[..., 5:]) + 1e-5
         value = self.value_fc(features)
+        
         return means, stds, value
 
     def act(self, state):
         with torch.no_grad():
-            # Ensure state is properly shaped: (1, seq_len, input_dim)
             if isinstance(state, np.ndarray):
                 state = torch.FloatTensor(state).to(Config.DEVICE)
             if state.dim() == 2:
@@ -247,12 +244,13 @@ class ForexPolicyNetwork(nn.Module):
             dist = Normal(means, stds)
             action = dist.sample()
             action = torch.tanh(action)
+            
             low, high = self.action_bounds[:, 0], self.action_bounds[:, 1]
             scaled_action = low + (0.5 * (action + 1.0)) * (high - low)
+            
             return scaled_action.cpu().numpy(), dist.log_prob(action).sum(-1).cpu().numpy(), value.cpu().numpy()
 
 # ================ TRADING ENVIRONMENT ================
-
 class ForexTradingEnv(gym.Env):
     def __init__(self, data_engine):
         super().__init__()
@@ -292,10 +290,10 @@ class ForexTradingEnv(gym.Env):
         atr_pips = min(max(scaled_atr / pip_size, 10), 100)
         sl_pips = atr_pips * sl_mult
         tp_pips = atr_pips * tp_mult
-        
+
         if tp_pips / sl_pips < 1.3:
             tp_pips = sl_pips * 1.3
-            
+
         if direction == 1:
             return entry_price - (sl_pips * pip_size), entry_price + (tp_pips * pip_size)
         else:
@@ -310,16 +308,14 @@ class ForexTradingEnv(gym.Env):
         atr = row["ATR_14"]
         
         signal, sl_mult, tp_mult, sentiment_exit, confidence = action
-        
         trade_opened = False
-        
+
         if (confidence >= self.confidence_threshold and
             symbol not in self.open_positions and
             len(self.open_positions) < Config.MAX_OPEN_TRADES):
             
             direction = 1 if signal >= 0.5 else -1
             entry_price = high * 1.0001 if direction == 1 else low * 0.9999
-            
             stop_loss, take_profit = self._calculate_stops(
                 entry_price, direction, atr, sl_mult, tp_mult, symbol
             )
@@ -327,7 +323,6 @@ class ForexTradingEnv(gym.Env):
             pip_size = self.pip_sizes[symbol]
             stop_distance = abs(entry_price - stop_loss) / pip_size
             pip_value = 10.0 if symbol != "USDJPY" else 1000 / entry_price
-            
             risk_amount = Config.MIN_RISK + confidence * (Config.MAX_RISK - Config.MIN_RISK)
             lot_size = min(max((risk_amount * self.balance) / (stop_distance * pip_value), 0.1), 15.0)
             
@@ -340,51 +335,47 @@ class ForexTradingEnv(gym.Env):
                 'open_step': self.current_step[symbol]
             }
             trade_opened = True
-            
+
         reward = 0
-        
         for sym, pos in list(self.open_positions.items()):
             if sym != symbol:
                 continue
-                
+
             direction = pos['direction']
             exit_price = None
             penalty = False
-            
+
             # SL exit
             if (direction == 1 and low <= pos['stop_loss']) or (direction == -1 and high >= pos['stop_loss']):
                 exit_price = pos['stop_loss']
                 penalty = True
-                
             # TP exit
             elif (direction == 1 and high >= pos['take_profit']) or (direction == -1 and low <= pos['take_profit']):
                 exit_price = pos['take_profit']
-                
             # Time exit
             elif (self.current_step[sym] - pos['open_step']) >= 24:
                 exit_price = current_price
-                
+
             if exit_price is not None:
                 price_diff = exit_price - pos['entry_price']
                 if "JPY" in sym:
                     pnl = price_diff * direction * pos['lot_size'] * 1000 / exit_price
                 else:
                     pnl = price_diff * direction * pos['lot_size'] * 100000
-                    
+                
                 pnl -= Config.COMMISSION * pos['lot_size']
                 
                 if penalty:
                     reward += pnl - abs(pnl) * 0.3
                 else:
                     reward += pnl + abs(pnl) * 0.2
-                    
-                del self.open_positions[sym]
                 
+                del self.open_positions[sym]
+
         if not trade_opened and row['volatility'] > 0.002:
             reward -= 10.0
-            
-        reward -= 0.05
         
+        reward -= 0.05
         self.current_step[symbol] += 1
         self.current_symbol = np.random.choice(self.symbols)
         
@@ -400,13 +391,10 @@ class ForexTradingEnv(gym.Env):
             self.confidence_threshold = Config.FINAL_CONFIDENCE
 
 # ================ PPO TRAINING ================
-
 class ForexPPOTrainer:
     def __init__(self, env):
         self.env = env
-        self.policy = ForexPolicyNetwork(
-            Config.FEATURE_DIM
-        ).to(Config.DEVICE)
+        self.policy = ForexPolicyNetwork(Config.FEATURE_DIM).to(Config.DEVICE)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=Config.LR)
         self.scaler = torch.cuda.amp.GradScaler(enabled=Config.USE_AMP)
         self.writer = SummaryWriter(Config.LOG_DIR)
@@ -417,16 +405,15 @@ class ForexPPOTrainer:
         state = self.env.reset()
         state_tensor = torch.FloatTensor(state).to(Config.DEVICE).unsqueeze(0)
         global_step = 0
-        
+
         while global_step < Config.TIMESTEPS:
             progress = global_step / Config.TIMESTEPS
             self.env.update_confidence(progress)
-            
+
             action, log_prob, value = self.policy.act(state_tensor)
             next_state, reward, done, info = self.env.step(action)
-            
             next_state_tensor = torch.FloatTensor(next_state).to(Config.DEVICE).unsqueeze(0)
-            
+
             self.memory.append(self.Transition(
                 state_tensor,
                 torch.FloatTensor(action).to(Config.DEVICE),
@@ -435,18 +422,18 @@ class ForexPPOTrainer:
                 torch.FloatTensor([reward]).to(Config.DEVICE),
                 torch.FloatTensor([done]).to(Config.DEVICE)
             ))
-            
+
             state_tensor = next_state_tensor if not done else torch.FloatTensor(
                 self.env.reset()).to(Config.DEVICE).unsqueeze(0)
             
             global_step += 1
-            
+
             if len(self.memory) >= Config.BATCH_SIZE:
                 self.update_model()
-                
+
             if global_step % Config.SAVE_INTERVAL == 0:
                 self.save_checkpoint(global_step, info['balance'])
-                
+
         self.save_checkpoint(global_step, info['balance'], final=True)
         logger.info("Training complete")
 
@@ -458,40 +445,39 @@ class ForexPPOTrainer:
         rewards = torch.stack([t.reward for t in self.memory])
         dones = torch.stack([t.done for t in self.memory])
         self.memory.clear()
-        
+
         returns = torch.zeros_like(rewards)
         last_value = self.policy(states[-1:])[2]
         returns[-1] = rewards[-1] + Config.GAMMA * (1 - dones[-1]) * last_value
-        
+
         for t in reversed(range(len(returns)-1)):
             returns[t] = rewards[t] + Config.GAMMA * (1 - dones[t]) * returns[t+1]
-            
+
         advantages = returns - old_values.squeeze()
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         for _ in range(Config.N_EPOCHS):
             with torch.cuda.amp.autocast(enabled=Config.USE_AMP):
                 means, stds, values = self.policy(states)
                 dist = Normal(means, stds)
                 log_probs = dist.log_prob(actions).sum(-1)
                 ratio = (log_probs - old_log_probs).exp()
-                
+
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1-Config.CLIP_PARAM, 1+Config.CLIP_PARAM) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
-                
                 value_loss = 0.5 * (returns - values.squeeze()).pow(2).mean()
                 entropy = dist.entropy().mean()
-                
+
                 loss = policy_loss + Config.VALUE_COEF * value_loss - Config.ENTROPY_COEF * entropy
-                
+
                 self.optimizer.zero_grad()
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), Config.GRAD_CLIP)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                
+
                 self.writer.add_scalar("Loss/Total", loss.item(), global_step)
 
     def save_checkpoint(self, step, balance, final=False):
@@ -505,20 +491,19 @@ class ForexPPOTrainer:
         logger.info("Saved checkpoint at step %d, balance $%.2f", step, balance)
 
 # ================ MAIN EXECUTION ================
-
 if __name__ == "__main__":
     logger.info("Starting FPFX Forex AI Training")
     logger.info("Base directory: %s", Config.BASE_DIR)
-    
+
     # Estimate training time
     start_time = time.time()
-    
+
     # Initialize and train
     data_engine = ForexDataEngine()
     env = ForexTradingEnv(data_engine)
     trainer = ForexPPOTrainer(env)
     trainer.train()
-    
+
     # Training summary
     duration = time.time() - start_time
     logger.info("Training completed in %.2f hours", duration/3600)
