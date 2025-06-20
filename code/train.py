@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-OPTIMIZED FOREX AI TRAINER - Fixed Version for RunPod RTX 4000 Ada
+OPTIMIZED FOREX AI TRAINER - Fixed Action Shape
 """
 
 import os
@@ -248,7 +248,8 @@ class ForexPolicyNetwork(nn.Module):
             low, high = self.action_bounds[:, 0], self.action_bounds[:, 1]
             scaled_action = low + (0.5 * (action + 1.0)) * (high - low)
             
-            return scaled_action.cpu().numpy(), dist.log_prob(action).sum(-1).cpu().numpy(), value.cpu().numpy()
+            # Return the action as a 1D array with 5 elements
+            return scaled_action.squeeze().cpu().numpy(), dist.log_prob(action).sum(-1).item(), value.item()
 
 # ================ TRADING ENVIRONMENT ================
 class ForexTradingEnv(gym.Env):
@@ -306,6 +307,11 @@ class ForexTradingEnv(gym.Env):
         high = row["high"]
         low = row["low"]
         atr = row["ATR_14"]
+        
+        # Ensure action has 5 elements
+        if len(action) != 5:
+            logger.error(f"Invalid action shape: {action.shape}, expected 5 elements")
+            action = np.array([0.5, 2.5, 3.0, 0.0, 0.5])  # Default safe action
         
         signal, sl_mult, tp_mult, sentiment_exit, confidence = action
         trade_opened = False
