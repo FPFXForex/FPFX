@@ -51,7 +51,7 @@ class Config:
     EXPLORATION_DECAY = 0.65
 
     # Neural network architecture
-    FEATURE_DIM = 64
+    FEATURE_DIM = 26  # Updated to match actual feature count (24 time steps x 26 features)
     TEMPORAL_DIM = 128
     POLICY_DIM = 256
 
@@ -198,10 +198,12 @@ class TemporalFeatureExtractor(nn.Module):
         self.conv = nn.Conv1d(input_dim, Config.TEMPORAL_DIM//2, kernel_size=3, padding=1)
 
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        cnn_out = x.transpose(1, 2)
-        cnn_out = torch.relu(self.conv(cnn_out)).transpose(1, 2)
-        return torch.cat([lstm_out, cnn_out], dim=-1)[:, -1, :]
+        # x shape: (batch_size, seq_len, input_dim)
+        lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, TEMPORAL_DIM//2 * 2)
+        cnn_out = x.transpose(1, 2)  # (batch_size, input_dim, seq_len)
+        cnn_out = torch.relu(self.conv(cnn_out)).transpose(1, 2)  # (batch_size, seq_len, TEMPORAL_DIM//2)
+        combined = torch.cat([lstm_out, cnn_out], dim=-1)  # (batch_size, seq_len, TEMPORAL_DIM)
+        return combined[:, -1, :]  # (batch_size, TEMPORAL_DIM)
 
 class ForexPolicyNetwork(nn.Module):
     def __init__(self, input_dim):
@@ -222,6 +224,10 @@ class ForexPolicyNetwork(nn.Module):
         ], device=Config.DEVICE)
 
     def forward(self, x):
+        # Ensure input is properly shaped: (batch_size, seq_len, input_dim)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)  # Add batch dimension if missing
+            
         features = self.feature_extractor(x)
         policy_params = self.policy_fc(features)
         means = policy_params[..., :5]
@@ -231,6 +237,12 @@ class ForexPolicyNetwork(nn.Module):
 
     def act(self, state):
         with torch.no_grad():
+            # Ensure state is properly shaped: (1, seq_len, input_dim)
+            if isinstance(state, np.ndarray):
+                state = torch.FloatTensor(state).to(Config.DEVICE)
+            if state.dim() == 2:
+                state = state.unsqueeze(0)
+                
             means, stds, value = self.forward(state)
             dist = Normal(means, stds)
             action = dist.sample()
@@ -258,7 +270,7 @@ class ForexTradingEnv(gym.Env):
             dtype=np.float32
         )
         self.observation_space = spaces.Box(
-            low=-10, high=10, shape=(24, 26), dtype=np.float32 # Updated shape to match new feature count
+            low=-10, high=10, shape=(24, Config.FEATURE_DIM), dtype=np.float32
         )
         self.reset()
 
@@ -270,7 +282,9 @@ class ForexTradingEnv(gym.Env):
 
     def _get_observation(self, symbol):
         seq_data = self.data_engine.get_sequence(symbol, self.current_step[symbol], 24)
-        return seq_data['features'] if seq_data else np.zeros((24, 26), dtype=np.float32) # Updated shape
+        if seq_data is None:
+            return np.zeros((24, Config.FEATURE_DIM), dtype=np.float32)
+        return seq_data['features']
 
     def _calculate_stops(self, entry_price, direction, atr, sl_mult, tp_mult, symbol):
         scaled_atr = atr * 10
@@ -391,7 +405,7 @@ class ForexPPOTrainer:
     def __init__(self, env):
         self.env = env
         self.policy = ForexPolicyNetwork(
-            self.env.observation_space.shape[-1]
+            Config.FEATURE_DIM
         ).to(Config.DEVICE)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=Config.LR)
         self.scaler = torch.cuda.amp.GradScaler(enabled=Config.USE_AMP)
@@ -401,7 +415,7 @@ class ForexPPOTrainer:
 
     def train(self):
         state = self.env.reset()
-        state_tensor = torch.tensor(state, dtype=torch.float32, device=Config.DEVICE).unsqueeze(0)
+        state_tensor = torch.FloatTensor(state).to(Config.DEVICE).unsqueeze(0)
         global_step = 0
         
         while global_step < Config.TIMESTEPS:
@@ -411,19 +425,19 @@ class ForexPPOTrainer:
             action, log_prob, value = self.policy.act(state_tensor)
             next_state, reward, done, info = self.env.step(action)
             
-            next_state_tensor = torch.tensor(next_state, dtype=torch.float32, device=Config.DEVICE).unsqueeze(0)
+            next_state_tensor = torch.FloatTensor(next_state).to(Config.DEVICE).unsqueeze(0)
             
             self.memory.append(self.Transition(
                 state_tensor,
-                torch.tensor(action, dtype=torch.float32),
-                torch.tensor(log_prob, dtype=torch.float32),
-                torch.tensor(value, dtype=torch.float32),
-                torch.tensor(reward, dtype=torch.float32),
-                torch.tensor(done, dtype=torch.float32)
+                torch.FloatTensor(action).to(Config.DEVICE),
+                torch.FloatTensor([log_prob]).to(Config.DEVICE),
+                torch.FloatTensor([value]).to(Config.DEVICE),
+                torch.FloatTensor([reward]).to(Config.DEVICE),
+                torch.FloatTensor([done]).to(Config.DEVICE)
             ))
             
-            state_tensor = next_state_tensor if not done else torch.tensor(
-                self.env.reset(), dtype=torch.float32, device=Config.DEVICE).unsqueeze(0)
+            state_tensor = next_state_tensor if not done else torch.FloatTensor(
+                self.env.reset()).to(Config.DEVICE).unsqueeze(0)
             
             global_step += 1
             
