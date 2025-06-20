@@ -67,7 +67,7 @@ class Config:
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # root/FPFX
     MODEL_DIR = os.path.join(BASE_DIR, "model") # root/FPFX/model
     LOG_DIR = os.path.join(BASE_DIR, "logs")
-    DATA_DIR = os.path.join(BASE_DIR, "Data", "processed") # root/FPFX/Data/processed
+    DATA_DIR = os.path.join(BASE_DIR, "Data", "Processed") # root/FPFX/Data/processed
     NEWS_PATH = os.path.join(BASE_DIR, "Data", "news_cache.csv") # root/FPFX/Data/news_cache.csv
     SAVE_INTERVAL = 100000
     USE_AMP = True if torch.cuda.is_available() else False
