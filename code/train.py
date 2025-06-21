@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 """
-OPTIMIZED FOREX AI TRAINER - Final Fixed Version
+
+OPTIMIZED FOREX AI TRAINER - Final Stable Version
+
 """
 
 import os
@@ -27,6 +29,7 @@ from datetime import datetime, timedelta
 warnings.filterwarnings("ignore", category=UserWarning, module="gym")
 
 # ================ CONFIG WITH FPFX PATHS ================
+
 class Config:
     # Core parameters
     SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
@@ -93,6 +96,7 @@ logger.info("Model directory: %s", Config.MODEL_DIR)
 logger.info("Data directory: %s", Config.DATA_DIR)
 
 # ================ TRADE TRACKING ================
+
 class TradeTracker:
     def __init__(self):
         self.closed_trades = deque(maxlen=10)
@@ -105,7 +109,7 @@ class TradeTracker:
         self.last_report_time = self.start_time
         self.period_pnl = 0
         self.period_trades = 0
-        
+
     def open_trade(self, symbol, direction, entry_price, stop_loss, take_profit, lot_size, step_time):
         trade_id = f"{symbol}-{time.time()}"
         self.open_trades[trade_id] = {
@@ -121,7 +125,7 @@ class TradeTracker:
         }
         self.total_trades += 1
         return trade_id
-        
+
     def close_trade(self, trade_id, exit_price, exit_time, exit_reason, pnl):
         if trade_id in self.open_trades:
             trade = self.open_trades.pop(trade_id)
@@ -139,19 +143,19 @@ class TradeTracker:
             self.period_trades += 1
             return trade
         return None
-        
+
     def update_max_drawdown(self, current_balance):
         self.max_balance = max(self.max_balance, current_balance)
         drawdown = (self.max_balance - current_balance) / self.max_balance
         return drawdown
-        
+
     def should_report(self):
         current_time = time.time()
         if current_time - self.last_report_time >= Config.PROGRESS_INTERVAL:
             self.last_report_time = current_time
             return True
         return False
-        
+
     def generate_report(self, current_balance, current_step, total_steps):
         elapsed = time.time() - self.start_time
         progress = current_step / total_steps
@@ -166,11 +170,11 @@ class TradeTracker:
         report += f"Period PnL: ${self.period_pnl:,.2f}\n"
         report += f"Total Trades: {self.total_trades} | "
         report += f"Period Trades: {self.period_trades}\n"
-        
+
         # Reset period stats
         self.period_pnl = 0
         self.period_trades = 0
-        
+
         # Add open trades
         if self.open_trades:
             report += "\n=== Open Trades ===\n"
@@ -180,7 +184,7 @@ class TradeTracker:
                           f"SL: {trade['stop_loss']:.5f} | "
                           f"TP: {trade['take_profit']:.5f} | "
                           f"Size: {trade['lot_size']:.2f} lots\n")
-        
+
         # Add closed trades
         if self.closed_trades:
             report += "\n=== Recent Closed Trades ===\n"
@@ -194,6 +198,7 @@ class TradeTracker:
         return report
 
 # ================ DATA ENGINEERING ================
+
 class ForexDataEngine:
     def __init__(self):
         self.data = self.load_and_process()
@@ -212,7 +217,7 @@ class ForexDataEngine:
                 df['hour'] = df['time'].dt.hour.astype(np.float32)
                 df['day_of_week'] = df['time'].dt.dayofweek.astype(np.float32)
                 df['volatility'] = ((df['high'] - df['low']) / 
-                                  df['close'].shift(1).replace(0, 1)).fillna(0).astype(np.float32)
+                                    df['close'].shift(1).replace(0, 1)).fillna(0).astype(np.float32)
                 data[symbol] = df
                 logger.info("Loaded %d rows for %s", len(df), symbol)
             except Exception as e:
@@ -222,7 +227,7 @@ class ForexDataEngine:
         # Load news data
         logger.info("Loading news from: %s", Config.NEWS_PATH)
         news_df = self.load_news_data()
-
+        
         # Convert date columns to same type before merge
         if not news_df.empty:
             news_df['date'] = pd.to_datetime(news_df['date']).dt.date
@@ -233,6 +238,7 @@ class ForexDataEngine:
                     df['news_count'] = df['news_count'].fillna(0).astype(np.float32)
                     df['avg_sentiment'] = df['avg_sentiment'].fillna(0).astype(np.float32)
                 data[symbol] = df
+                
         return data
 
     def load_news_data(self):
@@ -251,35 +257,32 @@ class ForexDataEngine:
     def create_scalers(self):
         scalers = {}
         all_data = pd.concat(self.data.values())
-
         tech_cols = ['RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
-                    'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
-                    'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
-                    'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility']
+                     'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
+                     'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
+                     'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility']
         scalers['tech'] = RobustScaler().fit(all_data[tech_cols])
-
+        
         price_cols = ['open', 'high', 'low', 'close']
         scalers['price'] = RobustScaler().fit(all_data[price_cols])
-
+        
         return scalers
 
     def get_sequence(self, symbol, index, seq_len):
         df = self.data[symbol]
         if index < seq_len or index >= len(df) - 4:
             return None
-
+            
         seq = df.iloc[index-seq_len:index]
-
         tech = self.scalers['tech'].transform(seq[[
             'RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
             'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
             'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
             'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility'
         ]])
-
         price = self.scalers['price'].transform(seq[['open', 'high', 'low', 'close']])
         temporal = np.stack([seq['hour'].values, seq['day_of_week'].values], axis=-1)
-
+        
         features = np.concatenate([tech, price, temporal], axis=1)
         return {
             'features': features.astype(np.float32),
@@ -289,6 +292,7 @@ class ForexDataEngine:
         }
 
 # ================ MODEL ARCHITECTURE ================
+
 class TemporalFeatureExtractor(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
@@ -311,6 +315,7 @@ class ForexPolicyNetwork(nn.Module):
         self.policy_fc = nn.Sequential(
             nn.Linear(Config.TEMPORAL_DIM, Config.POLICY_DIM),
             nn.ReLU(),
+            nn.LayerNorm(Config.POLICY_DIM),
             nn.Linear(Config.POLICY_DIM, 10)  # 5 means + 5 stds
         )
         
@@ -318,6 +323,7 @@ class ForexPolicyNetwork(nn.Module):
         self.value_fc = nn.Sequential(
             nn.Linear(Config.TEMPORAL_DIM, Config.POLICY_DIM),
             nn.ReLU(),
+            nn.LayerNorm(Config.POLICY_DIM),
             nn.Linear(Config.POLICY_DIM, 1)
         )
         
@@ -328,18 +334,14 @@ class ForexPolicyNetwork(nn.Module):
     def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(0)
-            
         features = self.feature_extractor(x)
         policy_params = self.policy_fc(features)
-        
         means = policy_params[..., :5]
         stds = torch.nn.functional.softplus(policy_params[..., 5:]) + 1e-6  # Add small epsilon
         
         # Clip means to reasonable bounds
-        means = torch.sigmoid(means) * 2 - 1  # Scale to [-1, 1] range
-        
+        means = torch.tanh(means)  # Bound to [-1, 1]
         value = self.value_fc(features)
-        
         return means.float(), stds.float(), value.float()
 
     def act(self, state):
@@ -348,22 +350,20 @@ class ForexPolicyNetwork(nn.Module):
                 state = torch.FloatTensor(state).to(Config.DEVICE)
             if state.dim() == 2:
                 state = state.unsqueeze(0)
-                
             means, stds, value = self.forward(state)
             
-            # Create distribution with numerical stability checks
+            # Numerical stability checks
             stds = torch.clamp(stds, min=1e-6, max=1.0)
             dist = Normal(means, stds)
-            
             action = dist.sample()
-            action = torch.tanh(action)  # Bound actions to [-1, 1]
+            action = torch.clamp(action, -1.0, 1.0)  # Hard bound
             
             low, high = self.action_bounds[:, 0], self.action_bounds[:, 1]
             scaled_action = low + (0.5 * (action + 1.0)) * (high - low)
-            
             return scaled_action.squeeze().cpu().numpy(), dist.log_prob(action).sum(-1).item(), value.item()
 
 # ================ TRADING ENVIRONMENT ================
+
 class ForexTradingEnv(gym.Env):
     def __init__(self, data_engine):
         super().__init__()
@@ -383,13 +383,13 @@ class ForexTradingEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-10, high=10, shape=(24, Config.FEATURE_DIM), dtype=np.float32
         )
-        self.trade_tracker = TradeTracker()
         self.reset()
 
     def reset(self):
         self.balance = Config.INITIAL_BALANCE
         self.open_positions = {}
         self.current_symbol = np.random.choice(self.symbols)
+        self.trade_tracker = TradeTracker()  # Reset trade tracker for new episode
         return self._get_observation(self.current_symbol)
 
     def _get_observation(self, symbol):
@@ -404,10 +404,10 @@ class ForexTradingEnv(gym.Env):
         atr_pips = min(max(scaled_atr / pip_size, 10), 100)
         sl_pips = atr_pips * sl_mult
         tp_pips = atr_pips * tp_mult
-
+        
         if tp_pips / sl_pips < 1.3:
             tp_pips = sl_pips * 1.3
-
+            
         if direction == 1:
             return entry_price - (sl_pips * pip_size), entry_price + (tp_pips * pip_size)
         else:
@@ -421,17 +421,20 @@ class ForexTradingEnv(gym.Env):
         low = row["low"]
         atr = row["ATR_14"]
         step_time = row["time"]
-        
+
         # Ensure action has 5 elements
         if len(action) != 5:
             logger.error(f"Invalid action shape: {len(action)}, expected 5 elements")
             action = np.array([0.5, 2.5, 3.0, 0.0, 0.5])  # Default safe action
-        
+
         signal, sl_mult, tp_mult, sentiment_exit, confidence = action
         trade_opened = False
 
+        # Check for existing open position on this symbol
+        has_open_position = any(pos['symbol'] == symbol for pos in self.open_positions.values())
+        
         if (confidence >= self.confidence_threshold and
-            symbol not in self.open_positions and
+            not has_open_position and
             len(self.open_positions) < Config.MAX_OPEN_TRADES):
             
             direction = 1 if signal >= 0.5 else -1
@@ -451,6 +454,7 @@ class ForexTradingEnv(gym.Env):
             )
             
             self.open_positions[trade_id] = {
+                'symbol': symbol,
                 'direction': direction,
                 'entry_price': entry_price,
                 'stop_loss': stop_loss,
@@ -462,9 +466,9 @@ class ForexTradingEnv(gym.Env):
 
         reward = 0
         for trade_id, pos in list(self.open_positions.items()):
-            if pos.get('symbol', symbol) != symbol:
+            if pos['symbol'] != symbol:
                 continue
-
+                
             direction = pos['direction']
             exit_price = None
             exit_reason = None
@@ -475,22 +479,23 @@ class ForexTradingEnv(gym.Env):
                 exit_price = pos['stop_loss']
                 exit_reason = "SL"
                 penalty = True
+                
             # TP exit
             elif (direction == 1 and high >= pos['take_profit']) or (direction == -1 and low <= pos['take_profit']):
                 exit_price = pos['take_profit']
                 exit_reason = "TP"
+                
             # Time exit
             elif (self.current_step[symbol] - pos['open_step']) >= Config.MAX_HOLD_BARS:
                 exit_price = current_price
                 exit_reason = "TIME"
-
+                
             if exit_price is not None:
                 price_diff = exit_price - pos['entry_price']
                 if "JPY" in symbol:
                     pnl = price_diff * direction * pos['lot_size'] * 1000 / exit_price
                 else:
                     pnl = price_diff * direction * pos['lot_size'] * 100000
-                
                 pnl -= Config.COMMISSION * pos['lot_size']
                 self.balance += pnl
                 
@@ -498,17 +503,18 @@ class ForexTradingEnv(gym.Env):
                     reward += pnl - abs(pnl) * 0.3
                 else:
                     reward += pnl + abs(pnl) * 0.2
-                
+                    
                 # Track the closed trade
                 self.trade_tracker.close_trade(
                     trade_id, exit_price, step_time, exit_reason, pnl
                 )
                 del self.open_positions[trade_id]
-
+                
         if not trade_opened and row['volatility'] > 0.002:
             reward -= 10.0
+            
+        reward -= 0.05  # Small step penalty
         
-        reward -= 0.05
         self.current_step[symbol] += 1
         self.current_symbol = np.random.choice(self.symbols)
         
@@ -521,8 +527,7 @@ class ForexTradingEnv(gym.Env):
         
         # Convert done to Python bool to avoid numpy.bool_ warning
         done = bool(done)
-        
-        return self._get_observation(self.current_symbol), reward, done, {
+        return self._get_observation(self.current_symbol), float(reward), done, {
             "balance": self.balance,
             "current_price": current_price,
             "symbol": symbol
@@ -530,11 +535,13 @@ class ForexTradingEnv(gym.Env):
 
     def update_confidence(self, progress):
         if progress < Config.EXPLORATION_DECAY:
-            self.confidence_threshold = Config.INIT_CONFIDENCE + (Config.FINAL_CONFIDENCE - Config.INIT_CONFIDENCE) * (progress / Config.EXPLORATION_DECAY)
+            self.confidence_threshold = Config.INIT_CONFIDENCE + \
+                (Config.FINAL_CONFIDENCE - Config.INIT_CONFIDENCE) * (progress / Config.EXPLORATION_DECAY)
         else:
             self.confidence_threshold = Config.FINAL_CONFIDENCE
 
 # ================ PPO TRAINING ================
+
 class ForexPPOTrainer:
     def __init__(self, env):
         self.env = env
@@ -549,37 +556,37 @@ class ForexPPOTrainer:
         state = self.env.reset()
         state_tensor = torch.FloatTensor(state).to(Config.DEVICE).unsqueeze(0)
         global_step = 0
-
+        
         while global_step < Config.TIMESTEPS:
             progress = global_step / Config.TIMESTEPS
             self.env.update_confidence(progress)
-
+            
             action, log_prob, value = self.policy.act(state_tensor)
             next_state, reward, done, info = self.env.step(action)
             next_state_tensor = torch.FloatTensor(next_state).to(Config.DEVICE).unsqueeze(0)
-
+            
             # Convert done to Python bool before creating tensor
             done_bool = bool(done)
+            
             self.memory.append(self.Transition(
                 state_tensor.float(),
                 torch.FloatTensor(action).to(Config.DEVICE),
                 torch.FloatTensor([log_prob]).to(Config.DEVICE),
                 torch.FloatTensor([value]).to(Config.DEVICE),
                 torch.FloatTensor([reward]).to(Config.DEVICE),
-                torch.FloatTensor([done_bool]).to(Config.DEVICE)  # Use Python bool here
+                torch.FloatTensor([done_bool]).to(Config.DEVICE)
             ))
-
+            
             state_tensor = next_state_tensor if not done else torch.FloatTensor(
                 self.env.reset()).to(Config.DEVICE).unsqueeze(0)
-            
             global_step += 1
-
+            
             if len(self.memory) >= Config.BATCH_SIZE:
                 self.update_model()
-
+                
             if global_step % Config.SAVE_INTERVAL == 0:
                 self.save_checkpoint(global_step, info['balance'])
-
+                
         self.save_checkpoint(global_step, info['balance'], final=True)
         logger.info("Training complete")
 
@@ -591,18 +598,17 @@ class ForexPPOTrainer:
         rewards = torch.stack([t.reward for t in self.memory]).float()
         dones = torch.stack([t.done for t in self.memory]).float()
         self.memory.clear()
-
+        
         returns = torch.zeros_like(rewards)
         with torch.no_grad():
             _, _, last_value = self.policy(states[-1:])
             returns[-1] = rewards[-1] + Config.GAMMA * (1 - dones[-1]) * last_value.squeeze()
-
-        for t in reversed(range(len(returns)-1)):
-            returns[t] = rewards[t] + Config.GAMMA * (1 - dones[t]) * returns[t+1]
-
+            for t in reversed(range(len(returns)-1)):
+                returns[t] = rewards[t] + Config.GAMMA * (1 - dones[t]) * returns[t+1]
+                
         advantages = returns - old_values.squeeze()
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
+        
         for _ in range(Config.N_EPOCHS):
             with torch.cuda.amp.autocast(enabled=Config.USE_AMP):
                 means, stds, values = self.policy(states)
@@ -610,26 +616,27 @@ class ForexPPOTrainer:
                 # Numerical stability checks
                 means = means.float()
                 stds = torch.clamp(stds.float(), min=1e-6, max=1.0)
-                
                 dist = Normal(means, stds)
                 log_probs = dist.log_prob(actions).sum(-1)
+                
                 ratio = (log_probs - old_log_probs).exp()
-
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1-Config.CLIP_PARAM, 1+Config.CLIP_PARAM) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
+                
                 value_loss = 0.5 * (returns - values.squeeze()).pow(2).mean()
                 entropy = dist.entropy().mean()
-
+                
                 loss = policy_loss + Config.VALUE_COEF * value_loss - Config.ENTROPY_COEF * entropy
-
+                
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), Config.GRAD_CLIP)
             self.scaler.step(self.optimizer)
             self.scaler.update()
-
+            
+            # Logging
             self.writer.add_scalar("Loss/Total", loss.item(), global_step)
 
     def save_checkpoint(self, step, balance, final=False):
@@ -643,13 +650,14 @@ class ForexPPOTrainer:
         logger.info("Saved checkpoint at step %d, balance $%.2f", step, balance)
 
 # ================ MAIN EXECUTION ================
+
 if __name__ == "__main__":
     logger.info("Starting FPFX Forex AI Training")
     logger.info("Base directory: %s", Config.BASE_DIR)
-
+    
     # Estimate training time
     start_time = time.time()
-
+    
     # Initialize and train
     data_engine = ForexDataEngine()
     env = ForexTradingEnv(data_engine)
@@ -662,7 +670,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Training failed: {str(e)}")
         raise
-
+    
     # Training summary
     duration = time.time() - start_time
     logger.info("Training completed in %.2f hours", duration/3600)
