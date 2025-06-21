@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-OPTIMIZED FOREX AI TRAINER - With Progress Reporting
+OPTIMIZED FOREX AI TRAINER - Final Fixed Version
 """
 
 import os
@@ -511,6 +511,9 @@ class ForexTradingEnv(gym.Env):
         if self.trade_tracker.should_report():
             logger.info(self.trade_tracker.generate_report(self.balance, self.current_step[symbol], Config.TIMESTEPS))
         
+        # Convert done to Python bool to avoid numpy.bool_ warning
+        done = bool(done)
+        
         return self._get_observation(self.current_symbol), reward, done, {
             "balance": self.balance,
             "current_price": current_price,
@@ -547,13 +550,15 @@ class ForexPPOTrainer:
             next_state, reward, done, info = self.env.step(action)
             next_state_tensor = torch.FloatTensor(next_state).to(Config.DEVICE).unsqueeze(0)
 
+            # Convert done to Python bool before creating tensor
+            done_bool = bool(done)
             self.memory.append(self.Transition(
                 state_tensor.float(),
                 torch.FloatTensor(action).to(Config.DEVICE),
                 torch.FloatTensor([log_prob]).to(Config.DEVICE),
                 torch.FloatTensor([value]).to(Config.DEVICE),
                 torch.FloatTensor([reward]).to(Config.DEVICE),
-                torch.FloatTensor([done]).to(Config.DEVICE)
+                torch.FloatTensor([done_bool]).to(Config.DEVICE)  # Use Python bool here
             ))
 
             state_tensor = next_state_tensor if not done else torch.FloatTensor(
@@ -640,7 +645,14 @@ if __name__ == "__main__":
     data_engine = ForexDataEngine()
     env = ForexTradingEnv(data_engine)
     trainer = ForexPPOTrainer(env)
-    trainer.train()
+    
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}")
+        raise
 
     # Training summary
     duration = time.time() - start_time
