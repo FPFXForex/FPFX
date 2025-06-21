@@ -333,7 +333,11 @@ class ForexPolicyNetwork(nn.Module):
         policy_params = self.policy_fc(features)
         
         means = policy_params[..., :5]
-        stds = torch.nn.functional.softplus(policy_params[..., 5:]) + 1e-5
+        stds = torch.nn.functional.softplus(policy_params[..., 5:]) + 1e-6  # Add small epsilon
+        
+        # Clip means to reasonable bounds
+        means = torch.sigmoid(means) * 2 - 1  # Scale to [-1, 1] range
+        
         value = self.value_fc(features)
         
         return means.float(), stds.float(), value.float()
@@ -346,9 +350,13 @@ class ForexPolicyNetwork(nn.Module):
                 state = state.unsqueeze(0)
                 
             means, stds, value = self.forward(state)
+            
+            # Create distribution with numerical stability checks
+            stds = torch.clamp(stds, min=1e-6, max=1.0)
             dist = Normal(means, stds)
+            
             action = dist.sample()
-            action = torch.tanh(action)
+            action = torch.tanh(action)  # Bound actions to [-1, 1]
             
             low, high = self.action_bounds[:, 0], self.action_bounds[:, 1]
             scaled_action = low + (0.5 * (action + 1.0)) * (high - low)
@@ -599,10 +607,11 @@ class ForexPPOTrainer:
             with torch.cuda.amp.autocast(enabled=Config.USE_AMP):
                 means, stds, values = self.policy(states)
                 
+                # Numerical stability checks
                 means = means.float()
-                stds = stds.float()
-                dist = Normal(means, stds)
+                stds = torch.clamp(stds.float(), min=1e-6, max=1.0)
                 
+                dist = Normal(means, stds)
                 log_probs = dist.log_prob(actions).sum(-1)
                 ratio = (log_probs - old_log_probs).exp()
 
