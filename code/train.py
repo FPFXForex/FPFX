@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-OPTIMIZED FOREX AI TRAINER - Fixed Action Shape
+OPTIMIZED FOREX AI TRAINER - Fixed AMP Compatibility
 """
 
 import os
@@ -53,7 +53,7 @@ class Config:
 
     # Neural network architecture
     FEATURE_DIM = 26  # 24 time steps x 26 features
-    TEMPORAL_DIM = 256  # Increased to match LSTM output
+    TEMPORAL_DIM = 256
     POLICY_DIM = 256
 
     # Training optimization
@@ -193,6 +193,7 @@ class TemporalFeatureExtractor(nn.Module):
 
     def forward(self, x):
         # x shape: (batch_size, seq_len, input_dim)
+        x = x.float()  # Ensure float32 input
         lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, TEMPORAL_DIM)
         lstm_out = self.layer_norm(lstm_out)
         return lstm_out[:, -1, :]  # (batch_size, TEMPORAL_DIM)
@@ -231,7 +232,7 @@ class ForexPolicyNetwork(nn.Module):
         stds = torch.nn.functional.softplus(policy_params[..., 5:]) + 1e-5
         value = self.value_fc(features)
         
-        return means, stds, value
+        return means.float(), stds.float(), value.float()  # Ensure float32 output
 
     def act(self, state):
         with torch.no_grad():
@@ -248,7 +249,6 @@ class ForexPolicyNetwork(nn.Module):
             low, high = self.action_bounds[:, 0], self.action_bounds[:, 1]
             scaled_action = low + (0.5 * (action + 1.0)) * (high - low)
             
-            # Return the action as a 1D array with 5 elements
             return scaled_action.squeeze().cpu().numpy(), dist.log_prob(action).sum(-1).item(), value.item()
 
 # ================ TRADING ENVIRONMENT ================
@@ -310,7 +310,7 @@ class ForexTradingEnv(gym.Env):
         
         # Ensure action has 5 elements
         if len(action) != 5:
-            logger.error(f"Invalid action shape: {action.shape}, expected 5 elements")
+            logger.error(f"Invalid action shape: {len(action)}, expected 5 elements")
             action = np.array([0.5, 2.5, 3.0, 0.0, 0.5])  # Default safe action
         
         signal, sl_mult, tp_mult, sentiment_exit, confidence = action
@@ -421,7 +421,7 @@ class ForexPPOTrainer:
             next_state_tensor = torch.FloatTensor(next_state).to(Config.DEVICE).unsqueeze(0)
 
             self.memory.append(self.Transition(
-                state_tensor,
+                state_tensor.float(),  # Ensure float32
                 torch.FloatTensor(action).to(Config.DEVICE),
                 torch.FloatTensor([log_prob]).to(Config.DEVICE),
                 torch.FloatTensor([value]).to(Config.DEVICE),
@@ -444,17 +444,19 @@ class ForexPPOTrainer:
         logger.info("Training complete")
 
     def update_model(self):
-        states = torch.cat([t.state for t in self.memory])
-        actions = torch.stack([t.action for t in self.memory])
-        old_log_probs = torch.stack([t.log_prob for t in self.memory])
-        old_values = torch.stack([t.value for t in self.memory])
-        rewards = torch.stack([t.reward for t in self.memory])
-        dones = torch.stack([t.done for t in self.memory])
+        # Convert all tensors to float32
+        states = torch.cat([t.state for t in self.memory]).float()
+        actions = torch.stack([t.action for t in self.memory]).float()
+        old_log_probs = torch.stack([t.log_prob for t in self.memory]).float()
+        old_values = torch.stack([t.value for t in self.memory]).float()
+        rewards = torch.stack([t.reward for t in self.memory]).float()
+        dones = torch.stack([t.done for t in self.memory]).float()
         self.memory.clear()
 
         returns = torch.zeros_like(rewards)
-        last_value = self.policy(states[-1:])[2]
-        returns[-1] = rewards[-1] + Config.GAMMA * (1 - dones[-1]) * last_value
+        with torch.no_grad():
+            _, _, last_value = self.policy(states[-1:])
+            returns[-1] = rewards[-1] + Config.GAMMA * (1 - dones[-1]) * last_value.squeeze()
 
         for t in reversed(range(len(returns)-1)):
             returns[t] = rewards[t] + Config.GAMMA * (1 - dones[t]) * returns[t+1]
@@ -465,7 +467,12 @@ class ForexPPOTrainer:
         for _ in range(Config.N_EPOCHS):
             with torch.cuda.amp.autocast(enabled=Config.USE_AMP):
                 means, stds, values = self.policy(states)
+                
+                # Convert to float32 for Normal distribution
+                means = means.float()
+                stds = stds.float()
                 dist = Normal(means, stds)
+                
                 log_probs = dist.log_prob(actions).sum(-1)
                 ratio = (log_probs - old_log_probs).exp()
 
@@ -477,14 +484,14 @@ class ForexPPOTrainer:
 
                 loss = policy_loss + Config.VALUE_COEF * value_loss - Config.ENTROPY_COEF * entropy
 
-                self.optimizer.zero_grad()
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), Config.GRAD_CLIP)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+            self.optimizer.zero_grad()
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), Config.GRAD_CLIP)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
-                self.writer.add_scalar("Loss/Total", loss.item(), global_step)
+            self.writer.add_scalar("Loss/Total", loss.item(), global_step)
 
     def save_checkpoint(self, step, balance, final=False):
         path = os.path.join(Config.MODEL_DIR, f"forex_{'final' if final else step}.pth")
