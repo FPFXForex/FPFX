@@ -604,14 +604,14 @@ class ForexPPOTrainer:
         self.writer = SummaryWriter(Config.LOG_DIR)
         self.Transition = namedtuple('Transition', ['state', 'action', 'log_prob', 'value', 'reward', 'done'])
         self.memory = deque(maxlen=Config.BATCH_SIZE)
+        self.global_step = 0  # Initialize global_step here
 
     def train(self):
         state = self.env.reset()
         state_tensor = torch.FloatTensor(state).to(Config.DEVICE).unsqueeze(0)
-        global_step = 0
         
-        while global_step < Config.TIMESTEPS:
-            progress = global_step / Config.TIMESTEPS
+        while self.global_step < Config.TIMESTEPS:
+            progress = self.global_step / Config.TIMESTEPS
             self.env.update_confidence(progress)
             
             action, log_prob, value = self.policy.act(state_tensor)
@@ -632,15 +632,15 @@ class ForexPPOTrainer:
             
             state_tensor = next_state_tensor if not done else torch.FloatTensor(
                 self.env.reset()).to(Config.DEVICE).unsqueeze(0)
-            global_step += 1
+            self.global_step += 1
             
             if len(self.memory) >= Config.BATCH_SIZE:
                 self.update_model()
                 
-            if global_step % Config.SAVE_INTERVAL == 0:
-                self.save_checkpoint(global_step, info['balance'])
+            if self.global_step % Config.SAVE_INTERVAL == 0:
+                self.save_checkpoint(self.global_step, info['balance'])
                 
-        self.save_checkpoint(global_step, info['balance'], final=True)
+        self.save_checkpoint(self.global_step, info['balance'], final=True)
         logger.info("Training complete")
 
     def update_model(self):
@@ -691,8 +691,8 @@ class ForexPPOTrainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             
-            # Logging
-            self.writer.add_scalar("Loss/Total", loss.item(), global_step)
+            # Logging - use self.global_step instead of global_step
+            self.writer.add_scalar("Loss/Total", loss.item(), self.global_step)
 
     def save_checkpoint(self, step, balance, final=False):
         path = os.path.join(Config.MODEL_DIR, f"forex_{'final' if final else step}.pth")
