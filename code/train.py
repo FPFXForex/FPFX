@@ -77,7 +77,7 @@ class Config:
     SAVE_INTERVAL = 100000
     USE_AMP = True if torch.cuda.is_available() else False
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    PROGRESS_INTERVAL = 120  # Seconds between progress reports
+    PROGRESS_INTERVAL = 60  # Seconds between progress reports (changed to 60 seconds)
 
     @classmethod
     def setup_directories(cls):
@@ -109,6 +109,7 @@ class TradeTracker:
         self.last_report_time = self.start_time
         self.period_pnl = 0
         self.period_trades = 0
+        self.last_balance = Config.INITIAL_BALANCE
 
     def open_trade(self, symbol, direction, entry_price, stop_loss, take_profit, lot_size, step_time):
         trade_id = f"{symbol}-{time.time()}"
@@ -161,6 +162,10 @@ class TradeTracker:
         progress = current_step / total_steps
         drawdown = self.update_max_drawdown(current_balance)
         
+        # Calculate steps per second
+        steps_per_sec = current_step / elapsed if elapsed > 0 else 0
+        time_remaining = (total_steps - current_step) / steps_per_sec if steps_per_sec > 0 else 0
+        
         report = f"\n=== Training Progress Report ===\n"
         report += f"Time: {timedelta(seconds=int(elapsed))} | "
         report += f"Progress: {progress:.1%} | "
@@ -170,6 +175,8 @@ class TradeTracker:
         report += f"Period PnL: ${self.period_pnl:,.2f}\n"
         report += f"Total Trades: {self.total_trades} | "
         report += f"Period Trades: {self.period_trades}\n"
+        report += f"Steps/s: {steps_per_sec:.2f} | "
+        report += f"ETA: {timedelta(seconds=int(time_remaining))}\n"
 
         # Reset period stats
         self.period_pnl = 0
@@ -178,22 +185,24 @@ class TradeTracker:
         # Add open trades
         if self.open_trades:
             report += "\n=== Open Trades ===\n"
-            for trade_id, trade in list(self.open_trades.items())[-3:]:  # Show last 3 open trades
+            for trade_id, trade in list(self.open_trades.items())[-5:]:  # Show last 5 open trades
                 report += (f"{trade['symbol']} {'LONG' if trade['direction'] == 1 else 'SHORT'} | "
                           f"Entry: {trade['entry_price']:.5f} | "
                           f"SL: {trade['stop_loss']:.5f} | "
                           f"TP: {trade['take_profit']:.5f} | "
-                          f"Size: {trade['lot_size']:.2f} lots\n")
+                          f"Size: {trade['lot_size']:.2f} lots | "
+                          f"Age: {trade['duration'] if 'duration' in trade else 'N/A'} mins\n")
 
         # Add closed trades
         if self.closed_trades:
             report += "\n=== Recent Closed Trades ===\n"
-            for trade in list(self.closed_trades)[-3:]:  # Show last 3 closed trades
+            for trade in list(self.closed_trades)[-5:]:  # Show last 5 closed trades
                 report += (f"{trade['symbol']} {'LONG' if trade['direction'] == 1 else 'SHORT'} | "
                           f"P/L: ${trade['pnl']:,.2f} ({'WIN' if trade['pnl'] > 0 else 'LOSS'}) | "
                           f"Entry: {trade['entry_price']:.5f} | "
                           f"Exit: {trade['exit_price']:.5f} | "
-                          f"Reason: {trade['exit_reason']}\n")
+                          f"Reason: {trade['exit_reason']} | "
+                          f"Duration: {trade.get('duration', 'N/A'):.1f} mins\n")
         
         return report
 
@@ -203,6 +212,10 @@ class ForexDataEngine:
     def __init__(self):
         self.data = self.load_and_process()
         self.scalers = self.create_scalers()
+        self.data_lengths = {symbol: len(df) for symbol, df in self.data.items()}
+        logger.info("Data lengths per symbol:")
+        for symbol, length in self.data_lengths.items():
+            logger.info(f"  {symbol}: {length} rows")
 
     def load_and_process(self):
         logger.info("Loading data from: %s", Config.DATA_DIR)
@@ -295,7 +308,8 @@ class ForexDataEngine:
 
     def get_sequence(self, symbol, index, seq_len):
         df = self.data[symbol]
-        if index < seq_len or index >= len(df) - 4:
+        # Ensure index is within valid range
+        if index < seq_len or index >= len(df):
             return None
             
         seq = df.iloc[index-seq_len:index]
@@ -422,7 +436,9 @@ class ForexTradingEnv(gym.Env):
         super().__init__()
         self.data_engine = data_engine
         self.symbols = Config.SYMBOLS
-        self.current_step = {s: 24 for s in self.symbols}
+        self.data_lengths = data_engine.data_lengths
+        # Start at different positions for each symbol to avoid simultaneous exhaustion
+        self.current_step = {s: 24 + i*1000 for i, s in enumerate(self.symbols)}
         self.confidence_threshold = Config.INIT_CONFIDENCE
         self.pip_sizes = {
             "EURUSD": 0.0001, "GBPUSD": 0.0001, "USDJPY": 0.01,
@@ -446,6 +462,10 @@ class ForexTradingEnv(gym.Env):
         return self._get_observation(self.current_symbol)
 
     def _get_observation(self, symbol):
+        # Check if current step is within bounds
+        if self.current_step[symbol] >= self.data_lengths[symbol]:
+            self.current_step[symbol] = 24  # Reset to safe starting point
+            
         seq_data = self.data_engine.get_sequence(symbol, self.current_step[symbol], 24)
         if seq_data is None:
             return np.zeros((24, Config.FEATURE_DIM), dtype=np.float32)
@@ -468,6 +488,13 @@ class ForexTradingEnv(gym.Env):
 
     def step(self, action):
         symbol = self.current_symbol
+        
+        # Check if current step is within bounds before accessing data
+        if self.current_step[symbol] >= self.data_lengths[symbol]:
+            # Reset to beginning if we've run out of data
+            self.current_step[symbol] = 24
+            logger.warning(f"Resetting step for {symbol} to 24 due to data bounds")
+            
         row = self.data_engine.data[symbol].iloc[self.current_step[symbol]]
         current_price = row["close"]
         high = row["high"]
@@ -513,7 +540,8 @@ class ForexTradingEnv(gym.Env):
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'lot_size': lot_size,
-                'open_step': self.current_step[symbol]
+                'open_step': self.current_step[symbol],
+                'open_time': step_time
             }
             trade_opened = True
 
@@ -571,8 +599,11 @@ class ForexTradingEnv(gym.Env):
         self.current_step[symbol] += 1
         self.current_symbol = np.random.choice(self.symbols)
         
-        done = (self.balance < Config.INITIAL_BALANCE * 0.75 or
-                self.current_step[symbol] >= len(self.data_engine.data[symbol]) - 10)
+        # Check if we're at the end of data for this symbol
+        if self.current_step[symbol] >= self.data_lengths[symbol]:
+            self.current_step[symbol] = 24  # Reset to beginning
+            
+        done = (self.balance < Config.INITIAL_BALANCE * 0.75)
         
         # Generate progress report if needed
         if self.trade_tracker.should_report():
