@@ -213,11 +213,30 @@ class ForexDataEngine:
             try:
                 df = pd.read_csv(path, parse_dates=["time"])
                 df["symbol"] = symbol
+                
+                # Validate data columns
+                required_cols = ['time', 'open', 'high', 'low', 'close', 'volume', 
+                                'RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
+                                'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
+                                'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
+                                'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility']
+                
+                for col in required_cols:
+                    if col not in df.columns:
+                        raise ValueError(f"Missing required column: {col}")
+                
+                # Handle potential NaN values
+                df.fillna(0, inplace=True)
+                
                 # Essential features
                 df['hour'] = df['time'].dt.hour.astype(np.float32)
                 df['day_of_week'] = df['time'].dt.dayofweek.astype(np.float32)
-                df['volatility'] = ((df['high'] - df['low']) / 
-                                    df['close'].shift(1).replace(0, 1)).fillna(0).astype(np.float32)
+                
+                # Verify volatility column exists or create it
+                if 'volatility' not in df.columns:
+                    df['volatility'] = ((df['high'] - df['low']) / 
+                                      df['close'].shift(1).replace(0, 1)).fillna(0).astype(np.float32)
+                
                 data[symbol] = df
                 logger.info("Loaded %d rows for %s", len(df), symbol)
             except Exception as e:
@@ -257,10 +276,16 @@ class ForexDataEngine:
     def create_scalers(self):
         scalers = {}
         all_data = pd.concat(self.data.values())
+        
+        # Technical indicators to scale
         tech_cols = ['RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
-                     'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
-                     'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
-                     'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility']
+                    'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
+                    'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
+                    'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility']
+        
+        # Handle potential infinite values
+        all_data[tech_cols] = all_data[tech_cols].replace([np.inf, -np.inf], 0)
+        
         scalers['tech'] = RobustScaler().fit(all_data[tech_cols])
         
         price_cols = ['open', 'high', 'low', 'close']
@@ -274,16 +299,31 @@ class ForexDataEngine:
             return None
             
         seq = df.iloc[index-seq_len:index]
-        tech = self.scalers['tech'].transform(seq[[
+        
+        # Technical indicators
+        tech_cols = [
             'RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
             'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
             'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
             'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility'
-        ]])
-        price = self.scalers['price'].transform(seq[['open', 'high', 'low', 'close']])
+        ]
+        
+        tech = self.scalers['tech'].transform(seq[tech_cols])
+        
+        # Price data
+        price_cols = ['open', 'high', 'low', 'close']
+        price = self.scalers['price'].transform(seq[price_cols])
+        
+        # Temporal features
         temporal = np.stack([seq['hour'].values, seq['day_of_week'].values], axis=-1)
         
+        # Combine all features
         features = np.concatenate([tech, price, temporal], axis=1)
+        
+        # Final validation
+        if np.isnan(features).any() or np.isinf(features).any():
+            features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         return {
             'features': features.astype(np.float32),
             'current_price': df.iloc[index]['close'],
@@ -334,13 +374,23 @@ class ForexPolicyNetwork(nn.Module):
     def forward(self, x):
         if x.dim() == 2:
             x = x.unsqueeze(0)
+            
         features = self.feature_extractor(x)
         policy_params = self.policy_fc(features)
-        means = policy_params[..., :5]
-        stds = torch.nn.functional.softplus(policy_params[..., 5:]) + 1e-6  # Add small epsilon
         
-        # Clip means to reasonable bounds
+        # Split into means and standard deviations
+        means = policy_params[..., :5]
+        stds = policy_params[..., 5:]
+        
+        # Apply stability transformations
         means = torch.tanh(means)  # Bound to [-1, 1]
+        stds = torch.nn.functional.softplus(stds) + 1e-6  # Ensure positive and non-zero
+        
+        # Additional stability checks
+        means = torch.nan_to_num(means, nan=0.0, posinf=1.0, neginf=-1.0)
+        stds = torch.nan_to_num(stds, nan=1.0, posinf=1.0, neginf=1e-6)
+        stds = torch.clamp(stds, min=1e-6, max=1.0)
+        
         value = self.value_fc(features)
         return means.float(), stds.float(), value.float()
 
@@ -350,10 +400,13 @@ class ForexPolicyNetwork(nn.Module):
                 state = torch.FloatTensor(state).to(Config.DEVICE)
             if state.dim() == 2:
                 state = state.unsqueeze(0)
+                
             means, stds, value = self.forward(state)
             
-            # Numerical stability checks
-            stds = torch.clamp(stds, min=1e-6, max=1.0)
+            # Additional numerical stability checks
+            means = torch.clamp(means, -1.0, 1.0)
+            stds = torch.clamp(stds, 1e-6, 1.0)
+            
             dist = Normal(means, stds)
             action = dist.sample()
             action = torch.clamp(action, -1.0, 1.0)  # Hard bound
@@ -614,8 +667,10 @@ class ForexPPOTrainer:
                 means, stds, values = self.policy(states)
                 
                 # Numerical stability checks
-                means = means.float()
-                stds = torch.clamp(stds.float(), min=1e-6, max=1.0)
+                means = torch.nan_to_num(means, nan=0.0, posinf=1.0, neginf=-1.0)
+                stds = torch.nan_to_num(stds, nan=1.0, posinf=1.0, neginf=1e-6)
+                stds = torch.clamp(stds, min=1e-6, max=1.0)
+                
                 dist = Normal(means, stds)
                 log_probs = dist.log_prob(actions).sum(-1)
                 
