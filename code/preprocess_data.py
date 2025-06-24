@@ -1,163 +1,231 @@
-# preprocess_data.py
-# (all your original comments kept unchanged)
-
 import os
 import pandas as pd
-import numpy as np
 import pandas_ta as ta
+import pytz
 from datetime import datetime
-from hmmlearn import hmm
-from sklearn.preprocessing import StandardScaler
-import joblib  # Added to save HMM model
-import pickle  # CRITICAL MISSING IMPORT ADDED
+import numpy as np
 
-# 1) Configuration
-SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"]
-INPUT_DIR = r"C:\FPFX\data"
-OUTPUT_DIR = r"C:\FPFX\data\processed"
-MODEL_DIR = r"C:\FPFX\model"  # Added to save HMM model
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)  # Ensure model directory exists
+# Configuration
+RAW_DATA_DIR = "C:/FPFX/Data"
+PROCESSED_DIR = "C:/FPFX/Data/Processed"
+SYMBOLS = ["AUDUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "XAUUSD"]
+START_DATE = "2023-06-12"
+END_DATE = "2025-06-12"
 
-# 2) Timeframe definitions (in minutes)
-TF_SETTINGS = {
-    "M5": 5,
-    "M15": 15,
-    "H1": 60,
-    "H4": 240,
-    "D1": "D"
-}
-
-def read_ticks_to_mid(filepath):
-    df = pd.read_csv(filepath, parse_dates=["time"])
-    df["mid"] = (df["bid"] + df["ask"]) / 2.0
-    df.set_index("time", inplace=True)
-    df.index = pd.to_datetime(df.index, utc=True)
-    return df[["mid"]]
-
-def resample_ohlc(mid_df, timeframe):
-    rule = "1D" if timeframe == "D" else f"{timeframe}min"
-    ohlc = pd.DataFrame()
-    ohlc["open"] = mid_df["mid"].resample(rule).first()
-    ohlc["high"] = mid_df["mid"].resample(rule).max()
-    ohlc["low"] = mid_df["mid"].resample(rule).min()
-    ohlc["close"] = mid_df["mid"].resample(rule).last()
-    ohlc["volume"] = mid_df["mid"].resample(rule).count()
-    ohlc.dropna(subset=["open"], inplace=True)
-    return ohlc
-
-def compute_indicators(ohlc_df, tf_label):
-    df = ohlc_df.copy()
-    if tf_label == "M5":
-        df["RSI_14"] = ta.rsi(df["close"], length=14)
-        bb = ta.bbands(df["close"], length=20, std=2)
-        df["BB_%B"] = bb["BBP_20_2.0"]
-        df["ATR_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-        stoch = ta.stoch(df["high"], df["low"], df["close"], k=14, d=3, smooth_k=3)
-        df["STOCH_%K"] = stoch["STOCHk_14_3_3"]
-        df["STOCH_%D"] = stoch["STOCHd_14_3_3"]
-    elif tf_label == "M15":
-        macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-        df["MACD"] = macd["MACD_12_26_9"]
-        df["MACD_signal"] = macd["MACDs_12_26_9"]
-        kc = ta.kc(df["high"], df["low"], df["close"], length=20, scalar=2.0)
-        kc_cols = kc.columns.tolist()
-        df["KC_upper"] = kc[kc_cols[0]]
-        df["KC_middle"] = kc[kc_cols[1]]
-        df["KC_lower"] = kc[kc_cols[2]]
-    elif tf_label == "H1":
-        df["SMA_50"] = ta.sma(df["close"], length=50)
-        df["ADX_14"] = ta.adx(df["high"], df["low"], df["close"], length=14)["ADX_14"]
-        df["PSAR"] = ta.psar(df["high"], df["low"], df["close"], step=0.02, max_step=0.2)["PSARl_0.02_0.2"]
-    elif tf_label == "H4":
-        ichi = ta.ichimoku(df["high"], df["low"], df["close"], tenkan=9, kijun=26, senkou=52)
-        if isinstance(ichi, pd.DataFrame):
-            df["Ichimoku_Tenkan"] = ichi["ITS_9_26_52"]
-            df["Ichimoku_Kijun"] = ichi["IKS_9_26_52"]
-            df["Ichimoku_Senkou_A"] = ichi["ISA_9_26_52"]
-            df["Ichimoku_Senkou_B"] = ichi["ISB_9_26_52"]
-        trix_df = ta.trix(df["close"], length=15)
-        if isinstance(trix_df, pd.DataFrame):
-            trix_col = trix_df.columns[0]
-            df["TRIX_15"] = trix_df[trix_col]
-        else:
-            df["TRIX_15"] = trix_df
-    elif tf_label == "D1":
-        df["SMA_200"] = ta.sma(df["close"], length=200)
-        df["VWMA_20"] = ta.vwma(df["close"], df["volume"], length=20)
+def calculate_all_indicators(df):
+    """Calculate all technical indicators with proper warm-up period"""
+    df = df.copy()
+    
+    # Calculate basic price features
+    df['range'] = df['high'] - df['low']
+    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+    
+    # Calculate indicators with proper warm-up periods
+    min_calc_length = 200  # Enough for SMA200
+    
+    if len(df) > min_calc_length:
+        # Volatility and momentum
+        df['volatility'] = df['close'].pct_change().rolling(20).std()
+        df['momentum'] = df['close'].pct_change(5)
+        
+        # SMAs
+        df['SMA_50'] = ta.sma(df['close'], length=50)
+        df['SMA_200'] = ta.sma(df['close'], length=200)
+        
+        # Oscillators
+        df['RSI_14'] = ta.rsi(df['close'], length=14)
+        stoch = ta.stoch(df['high'], df['low'], df['close'])
+        df['STOCH_%K'] = stoch['STOCHk_14_3_3']
+        df['STOCH_%D'] = stoch['STOCHd_14_3_3']
+        
+        # Trend indicators
+        adx_data = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['ADX_14'] = adx_data['ADX_14']
+        df['DMP_14'] = adx_data['DMP_14']
+        df['DMN_14'] = adx_data['DMN_14']
+        
+        # Bands
+        bb = ta.bbands(df['close'], length=20)
+        df['BB_%B'] = (df['close'] - bb['BBL_20_2.0']) / (bb['BBU_20_2.0'] - bb['BBL_20_2.0']).replace(0, 1e-10)
+        df['BB_width'] = (bb['BBU_20_2.0'] - bb['BBL_20_2.0']) / bb['BBM_20_2.0']
+        
+        kc = ta.kc(df['high'], df['low'], df['close'])
+        df['KC_upper'] = kc['KCUe_20_2']
+        df['KC_middle'] = kc['KCBe_20_2']
+        df['KC_lower'] = kc['KCLe_20_2']
+        
+        # MACD
+        macd = ta.macd(df['close'])
+        df['MACD_line'] = macd['MACD_12_26_9']
+        df['MACD_signal'] = macd['MACDs_12_26_9']
+        df['MACD_hist'] = macd['MACDh_12_26_9']
+        
+        # Other indicators
+        df['ATR_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
+        df['TRIX_15'] = ta.trix(df['close'], length=15)['TRIX_15_9']
+        df['PSAR'] = ta.psar(df['high'], df['low'], df['close'])['PSARl_0.02_0.2']
+        
+        # Volume features
+        df['volume_ma'] = df['volume'].rolling(20).mean()
+        df['volume_pct'] = df['volume'].pct_change()
+        
+        # Fill any remaining NaNs with reasonable values
+        df.fillna({
+            'RSI_14': 50,
+            'STOCH_%K': 50,
+            'STOCH_%D': 50,
+            'ADX_14': 25,
+            'BB_%B': 0.5,
+            'MACD_line': 0,
+            'MACD_signal': 0,
+            'MACD_hist': 0,
+            'volatility': df['range'].median(),
+            'volume_ma': df['volume'].median(),
+            'volume_pct': 0
+        }, inplace=True)
+        
+        # Calculate regimes based on SMAs
+        conditions = [
+            (df['close'] > df['SMA_50']) & (df['close'] > df['SMA_200']),  # Strong uptrend
+            (df['close'] > df['SMA_50']) & (df['close'] <= df['SMA_200']), # Weak uptrend
+            (df['close'] <= df['SMA_50']) & (df['close'] > df['SMA_200']), # Weak downtrend
+            (df['close'] <= df['SMA_50']) & (df['close'] <= df['SMA_200']) # Strong downtrend
+        ]
+        
+        for i in range(4):
+            df[f'Regime{i}'] = conditions[i].astype(int)
+    
+    else:
+        # Not enough data yet - fill with neutral values
+        neutral_vals = {
+            'RSI_14': 50,
+            'STOCH_%K': 50,
+            'STOCH_%D': 50,
+            'ADX_14': 25,
+            'BB_%B': 0.5,
+            'MACD_line': 0,
+            'MACD_signal': 0,
+            'MACD_hist': 0,
+            'volatility': df['range'].median(),
+            'SMA_50': df['close'],
+            'SMA_200': df['close'],
+            'volume_ma': df['volume'].median(),
+            'volume_pct': 0,
+            'Regime0': 0, 'Regime1': 0, 'Regime2': 0, 'Regime3': 1,
+            'ATR_14': df['range'].median(),
+            'TRIX_15': 0,
+            'PSAR': df['close'],
+            'KC_upper': df['high'],
+            'KC_middle': df['close'],
+            'KC_lower': df['low'],
+            'DMP_14': 0,
+            'DMN_14': 0,
+            'BB_width': 0
+        }
+        
+        for col, val in neutral_vals.items():
+            df[col] = val
+    
     return df
 
-def compute_hmm_regimes(h1_df):
-    df = h1_df.copy().dropna(subset=["ATR_14", "ADX_14", "SMA_50", "SMA_200"])
-    df["SMA_spread"] = df["SMA_50"] - df["SMA_200"]
-    features = df[["ATR_14", "ADX_14", "SMA_spread"]].values
-
-    scaler = StandardScaler()
-    scaled_feats = scaler.fit_transform(features)
-    mask = ~np.isnan(scaled_feats).any(axis=1)
-    scaled_feats = scaled_feats[mask]
-    valid_index = df.index[mask]
-
-    model = hmm.GaussianHMM(n_components=4, covariance_type="full", n_iter=1000, random_state=42)
-    model.fit(scaled_feats)
-    probs = model.predict_proba(scaled_feats)
+def process_symbol(symbol):
+    print(f"\nProcessing {symbol}...")
     
-    # SAVE HMM MODEL FOR LIVE TRADING (CRITICAL ADDITION)
-    hmm_model_path = os.path.join(MODEL_DIR, "H1_hmm_model.pkl")
-    with open(hmm_model_path, "wb") as f:
-        pickle.dump({"hmm_model": model, "scaler": scaler}, f)
-    print(f"Saved HMM model to {hmm_model_path}")
+    try:
+        # Read tick data
+        tick_file = os.path.join(RAW_DATA_DIR, f"{symbol}_ticks.csv")
+        tick_data = pd.read_csv(
+            tick_file,
+            usecols=['Time (EET)', 'Ask', 'Bid', 'AskVolume', 'BidVolume'],
+            dtype={'Ask': float, 'Bid': float, 'AskVolume': float, 'BidVolume': float}
+        )
+    except Exception as e:
+        print(f"Error reading {symbol} data: {str(e)}")
+        return False
 
-    regimes_df = pd.DataFrame(data=probs, index=valid_index, columns=[f"Regime{i}" for i in range(4)])
-    return regimes_df
+    # Convert EET to UTC
+    try:
+        eet = pytz.timezone('Europe/Bucharest')
+        tick_data['timestamp'] = pd.to_datetime(tick_data['Time (EET)'], format='%Y.%m.%d %H:%M:%S.%f', errors='coerce')
+        tick_data = tick_data.dropna(subset=['timestamp'])
+        tick_data['timestamp'] = tick_data['timestamp'].dt.tz_localize(eet).dt.tz_convert(pytz.UTC)
+        tick_data['timestamp'] = tick_data['timestamp'].dt.tz_localize(None)
+    except Exception as e:
+        print(f"Timestamp conversion failed: {str(e)}")
+        return False
 
-def merge_timeframes(symbol):
-    ticks_path = os.path.join(INPUT_DIR, f"{symbol}_ticks.csv")
-    print(f"Processing {symbol} ticks from:\n  {ticks_path}")
-    mid_df = read_ticks_to_mid(ticks_path)
+    # Filter by date range
+    tick_data = tick_data[
+        (tick_data['timestamp'] >= pd.to_datetime(START_DATE)) & 
+        (tick_data['timestamp'] <= pd.to_datetime(END_DATE))
+    ]
+    
+    if tick_data.empty:
+        print(f"No data for {symbol} in date range {START_DATE} to {END_DATE}")
+        return False
 
-    ohlc = {}
-    for tf_label, tf_value in TF_SETTINGS.items():
-        ohlc[tf_label] = resample_ohlc(mid_df, tf_value)
-        print(f"  {symbol}: {tf_label} bars = {len(ohlc[tf_label])} rows")
+    # Calculate mid price and resample
+    tick_data['mid'] = (tick_data['Ask'] + tick_data['Bid']) / 2
+    tick_data['volume'] = tick_data['AskVolume'] + tick_data['BidVolume']
+    
+    try:
+        ohlc = tick_data.resample('5min', on='timestamp').agg({
+            'mid': ['first', 'max', 'min', 'last'],
+            'volume': 'sum'
+        })
+        ohlc.columns = ['open', 'high', 'low', 'close', 'volume']
+        ohlc = ohlc.dropna()
+    except Exception as e:
+        print(f"Resampling failed: {str(e)}")
+        return False
 
-    ind = {}
-    for tf_label in TF_SETTINGS.keys():
-        ind[tf_label] = compute_indicators(ohlc[tf_label], tf_label)
-        print(f"  {symbol}: {tf_label} indicators computed")
+    # Calculate all indicators
+    ohlc = calculate_all_indicators(ohlc)
 
-    # Forward-fill SMA_200 from D1 into H1
-    d1 = ind["D1"][["SMA_200"]].dropna()
-    sma200_on_h1 = d1["SMA_200"].reindex(ind["H1"].index, method="ffill")
-    ind["H1"]["SMA_200"] = sma200_on_h1
+    # Time features
+    ohlc['hour'] = ohlc.index.hour
+    ohlc['day_of_week'] = ohlc.index.dayofweek
 
-    # Forward-fill ATR_14 from M5 into H1
-    atr14_on_h1 = ind["M5"]["ATR_14"].reindex(ind["H1"].index, method="ffill")
-    ind["H1"]["ATR_14"] = atr14_on_h1
+    # Ensure all required columns exist
+    required_columns = [
+        'open', 'high', 'low', 'close', 'volume',
+        'RSI_14', 'BB_%B', 'ATR_14', 'STOCH_%K', 'STOCH_%D',
+        'MACD_line', 'MACD_signal', 'KC_upper', 'KC_middle', 'KC_lower',
+        'SMA_50', 'ADX_14', 'PSAR', 'SMA_200', 'TRIX_15',
+        'Regime0', 'Regime1', 'Regime2', 'Regime3', 'volatility',
+        'hour', 'day_of_week', 'momentum', 'volume_ma', 'volume_pct',
+        'BB_width', 'MACD_hist', 'DMP_14', 'DMN_14'
+    ]
+    
+    for col in required_columns:
+        if col not in ohlc.columns:
+            ohlc[col] = 0  # Fill missing with 0
 
-    # Compute HMM regimes
-    regimes_h1 = compute_hmm_regimes(ind["H1"][["ATR_14", "ADX_14", "SMA_50", "SMA_200"]])
-    print(f"  {symbol}: HMM regimes computed, shape = {regimes_h1.shape}")
+    # Save processed data
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    output_file = os.path.join(PROCESSED_DIR, f"{symbol}_processed.csv")
+    
+    try:
+        ohlc[required_columns].to_csv(output_file, index=True)
+        print(f"Successfully processed {len(ohlc)} rows for {symbol}")
+        return True
+    except Exception as e:
+        print(f"Failed to save {symbol}: {str(e)}")
+        return False
 
-    # Merge all indicators onto M5 base
-    df_final = ind["M5"].copy()
-    for col in ind["M15"].columns:
-        df_final[col] = ind["M15"][col].reindex(df_final.index, method="ffill")
-    for col in ind["H1"].columns:
-        df_final[col] = ind["H1"][col].reindex(df_final.index, method="ffill")
-    for col in ind["H4"].columns:
-        df_final[col] = ind["H4"][col].reindex(df_final.index, method="ffill")
-    for col in ind["D1"].columns:
-        df_final[col] = ind["D1"][col].reindex(df_final.index, method="ffill")
-    for col in regimes_h1.columns:
-        df_final[col] = regimes_h1[col].reindex(df_final.index, method="ffill")
-
-    df_final.dropna(subset=["RSI_14", "BB_%B", "ATR_14", "STOCH_%K", "STOCH_%D"], inplace=True)
-    out_path = os.path.join(OUTPUT_DIR, f"{symbol}_processed.csv")
-    df_final.to_csv(out_path, index_label="time")
-    print(f"  {symbol}: final DataFrame shape = {df_final.shape}, saved to:\n    {out_path}\n")
+def main():
+    print(f"Processing data from {START_DATE} to {END_DATE}")
+    print(f"Input directory: {RAW_DATA_DIR}")
+    print(f"Output directory: {PROCESSED_DIR}")
+    
+    success_count = 0
+    for symbol in SYMBOLS:
+        if process_symbol(symbol):
+            success_count += 1
+    
+    print("\nProcessing complete!")
+    print(f"Successfully processed {success_count}/{len(SYMBOLS)} symbols")
+    print(f"Processed files saved to: {PROCESSED_DIR}")
 
 if __name__ == "__main__":
-    for sym in SYMBOLS:
-        merge_timeframes(sym)
-    print("All symbols processed and saved.")
+    main()
