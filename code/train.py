@@ -51,7 +51,7 @@ class Config:
     MAX_OPEN_TRADES = 3
     DAILY_DD_LIMIT = 0.20  # 20% max drawdown
     MIN_RISK = 0.005  # 0.5% of balance
-    MAX_RISK = 0.02  # 2% of balance
+    MAX_RISK = 0.015  # 1.5% of balance (changed from 2% to 1.5%)
     COMMISSION = 0.0002
     MIN_LOT = 0.01
     MAX_LOT = 100.0
@@ -269,7 +269,8 @@ class ForexTradingEnv(gym.Env):
         if sym == "XAUUSD": lot *= Config.XAUUSD_LOT_MULTIPLIER
         return max(Config.MIN_LOT, min(lot, Config.MAX_LOT))
 
-    def _is_significant_news(self, nc, sv): return nc>5 and abs(sv)>0.5
+    # Increased sentiment threshold from 0.5 to 0.7
+    def _is_significant_news(self, nc, sv): return nc>5 and abs(sv)>0.7
 
     def _calculate_risk_reward(self, entry, sl, tp, dir):
         r = abs(entry-sl); w = abs(tp-entry)
@@ -464,35 +465,49 @@ class ForexPolicy(nn.Module):
                 elif 'bias' in n: nn.init.constant_(p.data, 0)
 
     def forward(self, x):
-        # x: (batch=6,seq,feat)
-        # flatten batch for LSTM
-        b, seq, fe = x.shape
+        # Handle both single and batched inputs
+        if x.dim() == 3:  # Single observation: [6, seq, feat]
+            x = x.unsqueeze(0)  # Add batch dimension: [1, 6, seq, feat]
+            
+        batch_size = x.size(0)
+        # Flatten batch and symbols dimensions
+        x = x.view(-1, Config.SEQ_LEN, Config.FEATURE_DIM)  # [batch*6, seq, feat]
         out, _ = self.lstm(x)
-        f = self.feature_net(out[:,-1,:])
+        f = self.feature_net(out[:, -1, :])  # [batch*6, policy_dim]
         
+        # Compute actions per symbol
         sig = torch.sigmoid(self.actor_signal(f))
-        sl = 1.0 + 3.0*torch.sigmoid(self.actor_sl(f))
-        tp = 1.5 + 4.5*torch.sigmoid(self.actor_tp(f))
+        sl = 1.0 + 3.0 * torch.sigmoid(self.actor_sl(f))
+        tp = 1.5 + 4.5 * torch.sigmoid(self.actor_tp(f))
         conf = torch.sigmoid(self.actor_conf(f))
-        val = self.critic(f)
+        val = self.critic(f)  # Value per symbol [batch*6, 1]
         
-        # actions: (6,4)
-        acts = torch.cat([sig, sl, tp, conf], dim=-1)
-        return acts, val
+        # Reshape actions to [batch, 6, 4]
+        actions = torch.cat([sig, sl, tp, conf], dim=-1)
+        actions = actions.view(batch_size, 6, 4)
+        
+        # Aggregate values to get one value per state (mean of symbol values)
+        val = val.view(batch_size, 6, 1)
+        val_global = val.mean(dim=1)  # [batch, 1]
+        
+        return actions, val_global
 
     def act(self, obs):
-        # obs: (6,seq,feat)
+        # obs: [6, seq, feat]
         with torch.no_grad():
             t = torch.FloatTensor(obs).to(Config.DEVICE)
             acts, val = self.forward(t)
-            noise = torch.randn_like(acts)*0.1
+            acts = acts.squeeze(0)  # Remove batch dimension: [6,4]
+            
+            # Add noise for exploration
+            noise = torch.randn_like(acts) * 0.1
             na = acts + noise
-            # Fix: Changed from 3D indexing to 2D
-            na[:,0].clamp_(0,1)
-            na[:,1].clamp_(1.0,4.0)
-            na[:,2].clamp_(1.5,6.0)
-            na[:,3].clamp_(0,1)
-            return na.cpu().numpy(), val.cpu().numpy()
+            na[:, 0].clamp_(0, 1)      # Signal direction
+            na[:, 1].clamp_(1.0, 4.0)  # SL multiplier
+            na[:, 2].clamp_(1.5, 6.0)  # TP multiplier
+            na[:, 3].clamp_(0, 1)      # Confidence
+            
+            return na.cpu().numpy(), val.item()  # Return scalar value
 
 # ================ PPO TRAINER ================
 class PPOTrainer:
@@ -511,13 +526,13 @@ class PPOTrainer:
         ep_reward = 0; start = time.time()
         
         while self.step_count < Config.TIMESTEPS:
-            acts, vals = self.policy.act(obs)
+            acts, val = self.policy.act(obs)
             next_obs, rew, done, info = self.env.step(acts)
             
             prog = self.step_count/Config.TIMESTEPS
             self.env.update_confidence_threshold(prog)
             
-            self.memory.append(self.Transition(obs, acts, vals, rew, done))
+            self.memory.append(self.Transition(obs, acts, val, rew, done))
             obs = next_obs if not done else self.env.reset()
             
             self.step_count += 1; ep_reward += rew
@@ -537,7 +552,8 @@ class PPOTrainer:
                 self.writer.add_scalar("Episode/Drawdown", info[Config.SYMBOLS[0]]['drawdown'], self.episode_count)
                 ep_reward = 0
             
-            if len(self.memory) >= Config.BATCH_SIZE: self.update_policy()
+            if len(self.memory) >= Config.BATCH_SIZE: 
+                self.update_policy()
             
             if self.step_count % Config.SAVE_INTERVAL == 0:
                 bal = info[Config.SYMBOLS[0]]['balance']
@@ -552,41 +568,69 @@ class PPOTrainer:
         self.save_model(final=True)
 
     def update_policy(self):
-        obs_b = torch.tensor([t.obs for t in self.memory], dtype=torch.float32).to(Config.DEVICE)
-        acts_b = torch.tensor([t.action for t in self.memory], dtype=torch.float32).to(Config.DEVICE)
-        vals_b = torch.tensor([t.value for t in self.memory], dtype=torch.float32).to(Config.DEVICE)
-        rews = torch.tensor([t.reward for t in self.memory], dtype=torch.float32).to(Config.DEVICE)
-        dns = torch.tensor([t.done for t in self.memory], dtype=torch.float32).to(Config.DEVICE)
+        # Unpack memory
+        obs_b = torch.tensor(
+            [t.obs for t in self.memory], dtype=torch.float32
+        ).to(Config.DEVICE)
+        acts_b = torch.tensor(
+            [t.action for t in self.memory], dtype=torch.float32
+        ).to(Config.DEVICE)
+        vals_b = torch.tensor(
+            [t.value for t in self.memory], dtype=torch.float32
+        ).to(Config.DEVICE)
+        rews = torch.tensor(
+            [t.reward for t in self.memory], dtype=torch.float32
+        ).to(Config.DEVICE)
+        dns = torch.tensor(
+            [t.done for t in self.memory], dtype=torch.float32
+        ).to(Config.DEVICE)
         
-        returns = torch.zeros_like(rews); R = 0
+        # Compute returns
+        returns = torch.zeros_like(rews)
+        R = 0
         for i in reversed(range(len(rews))):
-            R = rews[i] + Config.GAMMA*R*(1-dns[i]); returns[i] = R
+            R = rews[i] + Config.GAMMA * R * (1 - dns[i])
+            returns[i] = R
         
-        returns = (returns-returns.mean())/(returns.std()+1e-8)
+        # Normalize returns
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         
+        # Policy updates
         for _ in range(Config.N_EPOCHS):
             new_acts, new_vals = self.policy(obs_b)
             new_vals = new_vals.squeeze()
             
-            adv = returns - vals_b; adv = (adv-adv.mean())/(adv.std()+1e-8)
-            ratio = torch.exp(-0.5*((acts_b-new_acts)**2).sum(-1))
+            # Compute advantages
+            adv = returns - vals_b
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
             
+            # Compute policy loss
+            ratio = torch.exp(-0.5 * ((acts_b - new_acts) ** 2).sum(-1))
             s1 = ratio * adv
             s2 = torch.clamp(ratio, 1-Config.CLIP_PARAM, 1+Config.CLIP_PARAM) * adv
-            p_loss = -torch.min(s1, s2).mean()
+            policy_loss = -torch.min(s1, s2).mean()
             
-            vu = (new_vals-returns)**2
-            vc = vals_b + torch.clamp(new_vals-vals_b, -Config.CLIP_PARAM, Config.CLIP_PARAM)
-            vl = (vc-returns)**2; v_loss = 0.5*torch.max(vu, vl).mean()
+            # Compute value loss
+            value_loss_unclipped = (new_vals - returns) ** 2
+            value_clipped = vals_b + torch.clamp(
+                new_vals - vals_b, -Config.CLIP_PARAM, Config.CLIP_PARAM
+            )
+            value_loss_clipped = (value_clipped - returns) ** 2
+            value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
             
-            ent = -0.5*torch.log(2*torch.tensor(math.pi)) - 0.5*(acts_b-new_acts).pow(2).mean()
-            e_bonus = Config.ENTROPY_COEF * ent
+            # Compute entropy bonus
+            entropy = -0.5 * (torch.log(2 * torch.tensor(math.pi)) - 0.5 * (acts_b - new_acts).pow(2).mean()
+            entropy_bonus = Config.ENTROPY_COEF * entropy
             
-            loss = p_loss + Config.VALUE_COEF*v_loss - e_bonus
+            # Total loss
+            loss = policy_loss + Config.VALUE_COEF * value_loss - entropy_bonus
             
-            self.optimizer.zero_grad(); loss.backward()
+            # Optimize
+            self.optimizer.zero_grad()
+            loss.backward()
             nn.utils.clip_grad_norm_(self.policy.parameters(), Config.GRAD_CLIP)
-            self.optimizer.step(); self.scheduler.step()
+            self.optimizer.step()
+            self.scheduler.step()
         
         self.memory.clear()
 
