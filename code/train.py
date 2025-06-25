@@ -196,7 +196,7 @@ class ForexDataEngine:
 
     def create_scalers(self):
         all_data = pd.concat(self.data.values())
-        numeric_cols = [col for col in self.get_feature_columns()
+        numeric_cols = [col for col in self.get_feature_columns() 
                         if col not in ['hour', 'day_of_week', 'Regime0', 'Regime1', 'Regime2', 'Regime3']]
         scaler = StandardScaler()
         scaler.fit(all_data[numeric_cols])
@@ -206,11 +206,12 @@ class ForexDataEngine:
         df = self.data[symbol]
         if index < Config.SEQ_LEN or index >= len(df):
             return None
+            
         seq = df.iloc[index-Config.SEQ_LEN:index]
         bar = df.iloc[index]
         
         # Prepare features
-        numeric_cols = [col for col in self.get_feature_columns()
+        numeric_cols = [col for col in self.get_feature_columns() 
                         if col not in ['hour', 'day_of_week', 'Regime0', 'Regime1', 'Regime2', 'Regime3']]
         scaled = self.scalers.transform(seq[numeric_cols])
         
@@ -256,11 +257,12 @@ class ForexTradingEnv(gym.Env):
         self.ct_final = Config.CONFIDENCE_THRESHOLD_END
         self.th_start = Config.THRESHOLD_TRANSITION_START
         self.th_end = Config.THRESHOLD_TRANSITION_END
+        
         self.reset()
         self.last_summary_time = time.time()
         self.opened_trades_history = deque(maxlen=Config.TRADE_HISTORY_SIZE)
         self.closed_trades_history = deque(maxlen=Config.TRADE_HISTORY_SIZE)
-
+        
     def reset(self):
         self.balance = Config.INITIAL_BALANCE
         self.equity = Config.INITIAL_BALANCE
@@ -274,7 +276,7 @@ class ForexTradingEnv(gym.Env):
         self.total_pnl = 0
         self.peak_drawdown = 0
         return self._get_obs()
-
+    
     def _get_obs(self):
         obs = []
         for s in self.symbols:
@@ -283,12 +285,14 @@ class ForexTradingEnv(gym.Env):
                 feats = np.zeros((Config.SEQ_LEN, Config.FEATURE_DIM), dtype=np.float32)
             else:
                 feats = bar['features']
+            
             # Debug logging for feature dimensions
             if feats.shape[1] != Config.FEATURE_DIM:
                 logger.warning(f"Unexpected feature dimension: {feats.shape} for {s}")
+                
             obs.append(feats)
         return np.stack(obs, axis=0)
-
+    
     def _calculate_stops(self, entry, dir, atr, slm, tpm, sym):
         pip = self.pip[sym]
         scaled = atr * 10
@@ -307,20 +311,19 @@ class ForexTradingEnv(gym.Env):
             pv = 1000.0 / entry
         else:
             pv = 10.0
+
         lot = risk_amt / (slp * pv)
-        if sym == "XAUUSD":
-            lot *= Config.XAUUSD_LOT_MULTIPLIER
         return max(Config.MIN_LOT, min(lot, Config.MAX_LOT))
-    
+
     # Increased news significance threshold
     def _is_significant_news(self, nc, sv):
         return nc > 5 and abs(sv) > 0.7
-
+        
     def _calculate_risk_reward(self, entry, sl, tp, dir):
         r = abs(entry - sl)
         w = abs(tp - entry)
         return w / r if r > 0 else 0
-
+        
     def _log_trade_summary(self):
         now = time.time()
         if now - self.last_summary_time < Config.PROGRESS_INTERVAL:
@@ -351,7 +354,7 @@ class ForexTradingEnv(gym.Env):
                 s += f"\n║ SL: {t['sl']:.5f} | TP: {t['tp']:.5f}"
                 s += f"\n║ Risk: ${t['risk_amount']:,.2f} | Conf: {t['confidence']:.2f}"
                 s += "\n╠═══════════════════╣"
-        
+                
         if self.closed_trades_history:
             s += "\n\n╔════════════════════╗"
             s += "\n║   Closed Trades    ║"
@@ -368,7 +371,7 @@ class ForexTradingEnv(gym.Env):
         logger.info(s)
         self.last_summary_time = now
         return True
-
+        
     def step(self, actions):
         total_reward = 0
         done = False
@@ -399,7 +402,7 @@ class ForexTradingEnv(gym.Env):
                 else:
                     pnl = diff * tr['direction'] * tr['size'] * 100000
                 self.equity += pnl
-            
+                
             # Process pending entries
             next_open = bar['open']
             pend = [pe for pe in self.pending_entries if pe['symbol'] == s]
@@ -423,7 +426,7 @@ class ForexTradingEnv(gym.Env):
             # Queue new trades
             active_trades = len([t for t in self.open_trades.values() if t['symbol']==s])
             pending_trades = len([pe for pe in self.pending_entries if pe['symbol']==s])
-            if (conf > self.confidence_threshold and
+            if (conf > self.confidence_threshold and 
                 active_trades + pending_trades < Config.MAX_OPEN_TRADES):
                 rf = Config.MIN_RISK + conf * (Config.MAX_RISK - Config.MIN_RISK)
                 pid = f"{s}-{self.trade_count}"
@@ -469,7 +472,7 @@ class ForexTradingEnv(gym.Env):
                     self.total_trades += 1
                     if pnl > 0:
                         self.profitable_trades += 1
-                    
+                        
                     # Reward shaping
                     reward_multiplier = 1.5 if rsn == "TP" else 0.8 if rsn == "SL" else 1.0
                     total_reward += pnl * reward_multiplier / 1000
@@ -511,7 +514,7 @@ class ForexTradingEnv(gym.Env):
         self._log_trade_summary()
         
         return np.stack(obs, 0), total_reward, done, infos
-
+        
     def update_confidence_threshold(self, progress):
         if progress < self.th_start:
             self.confidence_threshold = self.ct_initial
@@ -527,6 +530,7 @@ class ForexPolicy(nn.Module):
         super().__init__()
         # Reduced hidden size from 256 to 128
         self.lstm = nn.LSTM(input_dim, 128, 2, batch_first=True, bidirectional=True)
+        
         self.feature_net = nn.Sequential(
             nn.Linear(256, 128),  # Adjusted for bidirectional output (128*2=256)
             nn.LeakyReLU(),
@@ -534,17 +538,20 @@ class ForexPolicy(nn.Module):
             nn.Linear(128, Config.POLICY_DIM),  # POLICY_DIM reduced to 128
             nn.Tanh()
         )
+        
         self.actor_signal = nn.Linear(Config.POLICY_DIM, 1)
         self.actor_sl = nn.Linear(Config.POLICY_DIM, 1)
         self.actor_tp = nn.Linear(Config.POLICY_DIM, 1)
         self.actor_conf = nn.Linear(Config.POLICY_DIM, 1)
+        
         self.critic = nn.Sequential(
             nn.Linear(Config.POLICY_DIM, 128),
             nn.ReLU(),
             nn.Linear(128, 1)
         )
+        
         self.apply(self.init_weights)
-
+        
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
@@ -557,30 +564,35 @@ class ForexPolicy(nn.Module):
                     nn.init.orthogonal_(p.data)
                 elif 'bias' in n:
                     nn.init.constant_(p.data, 0)
-
+                    
     def forward(self, x):
         # Handle both single and batched inputs
         if x.dim() == 3:
             x = x.unsqueeze(0)
+            
         batch_size, num_symbols, seq_len, feat_dim = x.size()
         x = x.view(batch_size * num_symbols, seq_len, feat_dim)  # FIXED: Proper reshaping
+        
         out, _ = self.lstm(x)
         f = self.feature_net(out[:, -1, :])
+        
         sig = torch.sigmoid(self.actor_signal(f))
         sl = 1.0 + 3.0 * torch.sigmoid(self.actor_sl(f))
         tp = 1.5 + 4.5 * torch.sigmoid(self.actor_tp(f))
         conf = torch.sigmoid(self.actor_conf(f))
         val = self.critic(f)
+        
         actions = torch.cat([sig, sl, tp, conf], dim=-1)
         actions = actions.view(batch_size, num_symbols, 4)
         val = val.view(batch_size, num_symbols, 1).mean(dim=1)
         return actions, val
-
+        
     def act(self, obs):
         with torch.no_grad():
             t = torch.FloatTensor(obs).to(Config.DEVICE)
             acts, val = self.forward(t)
             acts = acts.squeeze(0)
+            
             # Exploration noise
             noise = torch.randn_like(acts) * 0.1
             na = acts + noise
@@ -604,16 +616,19 @@ class PPOTrainer:
         self.episode_count = 0
         self.best_balance = Config.INITIAL_BALANCE
         self.Transition = namedtuple('Transition', ['obs', 'action', 'value', 'reward', 'done'])
-
+        
     def train(self):
         obs = self.env.reset()
         ep_reward = 0
         start = time.time()
+        
         while self.step_count < Config.TIMESTEPS:
             acts, val = self.policy.act(obs)
             next_obs, rew, done, info = self.env.step(acts)
+            
             prog = self.step_count / Config.TIMESTEPS
             self.env.update_confidence_threshold(prog)
+            
             self.memory.append(self.Transition(obs, acts, val, rew, done))
             obs = next_obs if not done else self.env.reset()
             self.step_count += 1
@@ -654,7 +669,7 @@ class PPOTrainer:
                 logger.info(f"Step:{self.step_count}/{Config.TIMESTEPS}|Bal${info[Config.SYMBOLS[0]]['balance']:,.2f}|Speed{spd:.1f}sps|DD{info[Config.SYMBOLS[0]]['drawdown']*100:.1f}%")
                 
         self.save_model(final=True)
-
+        
     def update_policy(self):
         # Memory cleanup before update
         gc.collect()
@@ -746,6 +761,7 @@ class PPOTrainer:
             path = os.path.join(Config.MODEL_DIR, "forex_ai_final.pth")
         else:
             path = os.path.join(Config.MODEL_DIR, f"forex_ai_step_{self.step_count}.pth")
+            
         torch.save({
             'step': self.step_count,
             'model_state_dict': self.policy.state_dict(),
